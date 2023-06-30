@@ -494,7 +494,7 @@ func (gateway *HandleT) userWebRequestWorkerProcess(userWebRequestWorker *userWe
 		}
 		// Sending events to config backend
 		for _, eventBatch := range eventBatchesToRecord {
-			gateway.sourcehandle.RecordEvent(eventBatch.writeKey, eventBatch.data)
+			gateway.sourcehandle.RecordEvent(eventBatch.writeKey, eventBatch.data, writeKeysSourceMap[eventBatch.writeKey])
 		}
 
 		userWebRequestWorker.batchTimeStat.Since(batchStart)

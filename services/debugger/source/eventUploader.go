@@ -22,6 +22,7 @@ import (
 type GatewayEventBatchT struct {
 	WriteKey   string
 	EventBatch []byte
+	Source     backendconfig.SourceT
 }
 
 // EventUploadT is a structure to hold actual event data
@@ -32,10 +33,11 @@ type EventUploadBatchT struct {
 	WriteKey   string
 	ReceivedAt string
 	Batch      []EventUploadT
+	Source     backendconfig.SourceT
 }
 
 type SourceDebugger interface {
-	RecordEvent(writeKey string, eventBatch []byte) bool
+	RecordEvent(writeKey string, eventBatch []byte, source backendconfig.SourceT) bool
 	Stop()
 }
 
@@ -116,7 +118,7 @@ func (h *Handle) Stop() {
 
 // RecordEvent is used to put the event batch in the eventBatchChannel,
 // which will be processed by handleEvents.
-func (h *Handle) RecordEvent(writeKey string, eventBatch []byte) bool {
+func (h *Handle) RecordEvent(writeKey string, eventBatch []byte, source backendconfig.SourceT) bool {
 	if !h.started || h.disableEventUploads {
 		return false
 	}
@@ -131,7 +133,7 @@ func (h *Handle) RecordEvent(writeKey string, eventBatch []byte) bool {
 		}
 		return false
 	}
-	h.uploader.RecordEvent(&GatewayEventBatchT{writeKey, eventBatch})
+	h.uploader.RecordEvent(&GatewayEventBatchT{writeKey, eventBatch, source})
 	return true
 }
 
@@ -175,7 +177,7 @@ func (h *Handle) recordHistoricEvents(uploadEnabledWriteKeys []string) {
 			continue
 		}
 		for _, eventBatchData := range historicEvents {
-			h.uploader.RecordEvent(&GatewayEventBatchT{writeKey, eventBatchData})
+			h.uploader.RecordEvent(&GatewayEventBatchT{writeKey, eventBatchData, backendconfig.SourceT{}})
 		}
 	}
 }
@@ -214,6 +216,7 @@ func (e *EventUploader) Transform(eventBuffer []*GatewayEventBatchT) ([]byte, er
 			// add the receivedAt time to each event
 			event := map[string]interface{}{
 				"payload":       ev,
+				"metadata":      batchedEvent.Source,
 				"receivedAt":    receivedAtStr,
 				"eventName":     misc.GetStringifiedData(ev["event"]),
 				"eventType":     misc.GetStringifiedData(ev["type"]),
@@ -242,9 +245,10 @@ func NewNoOpService() SourceDebugger {
 type noopService struct{}
 
 func (*noopService) Start(_ backendconfig.BackendConfig) {
+
 }
 
-func (*noopService) RecordEvent(_ string, _ []byte) bool {
+func (*noopService) RecordEvent(_ string, _ []byte, _ backendconfig.SourceT) bool {
 	return false
 }
 
