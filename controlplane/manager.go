@@ -29,7 +29,7 @@ type LoggerI interface {
 	Errorf(format string, a ...interface{})
 }
 
-const defaultRetryInterval time.Duration = time.Second
+const defaultRetryInterval = time.Second
 
 func (cm *ConnectionManager) Apply(url string, active bool) {
 	if url == "" {
@@ -84,7 +84,7 @@ func (cm *ConnectionManager) closeConnection() error {
 	}()
 
 	if err := cm.connHandler.Close(); err != nil {
-		return fmt.Errorf("failed to close grpc connection: %w", err)
+		return fmt.Errorf("failed to close syncs connection: %w", err)
 	}
 
 	return nil

@@ -1,4 +1,4 @@
-package warehouse
+package syncs
 
 import (
 	"context"
@@ -18,8 +18,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/tidwall/gjson"
-
 	"github.com/rudderlabs/rudder-go-kit/config"
 	"github.com/rudderlabs/rudder-go-kit/filemanager"
 	"github.com/rudderlabs/rudder-go-kit/logger"
@@ -31,10 +29,12 @@ import (
 	"github.com/rudderlabs/rudder-server/utils/timeutil"
 	"github.com/rudderlabs/rudder-server/utils/types/deployment"
 	cpclient "github.com/rudderlabs/rudder-server/warehouse/client/controlplane"
+	"github.com/rudderlabs/rudder-server/warehouse/integrations/middleware/sqlquerywrapper"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/repo"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 	"github.com/rudderlabs/rudder-server/warehouse/validations"
+	"github.com/tidwall/gjson"
 )
 
 type UploadsReq struct {
@@ -104,13 +104,12 @@ type TableUploadRes struct {
 type UploadAPIT struct {
 	enabled           bool
 	dbHandle          *sql.DB
-	warehouseDBHandle *DB
+	warehouseDBHandle *sqlquerywrapper.DB
 	log               logger.Logger
 	connectionManager *controlplane.ConnectionManager
 	isMultiWorkspace  bool
+	conf              *config.Config
 }
-
-var UploadAPI UploadAPIT
 
 const (
 	TriggeredSuccessfully   = "Triggered successfully"
@@ -119,49 +118,54 @@ const (
 	NoSuchSync              = "No such sync exist"
 )
 
-func InitWarehouseAPI(dbHandle *sql.DB, log logger.Logger) error {
+func Setup(dbHandle *sql.DB, wrappedDBHandle *sqlquerywrapper.DB, conf *config.Config, logger logger.Logger) *UploadAPIT {
+	log := logger.Child("syncs")
+	return &UploadAPIT{
+		conf:              conf,
+		log:               log,
+		dbHandle:          dbHandle,
+		warehouseDBHandle: wrappedDBHandle,
+	}
+}
+
+func (a *UploadAPIT) Start() error {
 	connectionToken, tokenType, isMultiWorkspace, err := deployment.GetConnectionToken()
 	if err != nil {
+		a.log.Errorf("Error getting connection token: %v", err)
 		return err
 	}
 	labels := map[string]string{}
-	if region := config.GetString("region", ""); region != "" {
+	if region := a.conf.GetString("region", ""); region != "" {
 		labels["region"] = region
 	}
-
 	client := cpclient.NewInternalClientWithCache(
-		config.GetString("CONFIG_BACKEND_URL", "api.rudderlabs.com"),
+		a.conf.GetString("CONFIG_BACKEND_URL", "api.rudderlabs.com"),
 		cpclient.BasicAuth{
-			Username: config.GetString("CP_INTERNAL_API_USERNAME", ""),
-			Password: config.GetString("CP_INTERNAL_API_PASSWORD", ""),
+			Username: a.conf.GetString("CP_INTERNAL_API_USERNAME", ""),
+			Password: a.conf.GetString("CP_INTERNAL_API_PASSWORD", ""),
 		},
 	)
-
-	UploadAPI = UploadAPIT{
-		enabled:           true,
-		dbHandle:          dbHandle,
-		warehouseDBHandle: NewWarehouseDB(wrappedDBHandle),
-		log:               log,
-		isMultiWorkspace:  isMultiWorkspace,
-		connectionManager: &controlplane.ConnectionManager{
-			AuthInfo: controlplane.AuthInfo{
-				Service:         "warehouse",
-				ConnectionToken: connectionToken,
-				InstanceID:      config.GetString("INSTANCE_ID", "1"),
-				TokenType:       tokenType,
-				Labels:          labels,
-			},
-			RetryInterval: 0,
-			UseTLS:        config.GetBool("CP_ROUTER_USE_TLS", true),
-			Logger:        log,
-			RegisterService: func(srv *grpc.Server) {
-				proto.RegisterWarehouseServer(srv, &warehouseGRPC{
-					EnableTunnelling: config.GetBool("ENABLE_TUNNELLING", true),
-					CPClient:         client,
-				})
-			},
+	a.enabled = true
+	a.isMultiWorkspace = isMultiWorkspace
+	connectionManager := &controlplane.ConnectionManager{
+		AuthInfo: controlplane.AuthInfo{
+			Service:         "warehouse",
+			ConnectionToken: connectionToken,
+			InstanceID:      a.conf.GetString("INSTANCE_ID", "1"),
+			TokenType:       tokenType,
+			Labels:          labels,
+		},
+		RetryInterval: 0,
+		UseTLS:        a.conf.GetBool("CP_ROUTER_USE_TLS", true),
+		Logger:        a.log,
+		RegisterService: func(srv *grpc.Server) {
+			proto.RegisterWarehouseServer(srv, &warehouseGRPC{
+				EnableTunnelling: config.GetBool("ENABLE_TUNNELLING", true),
+				CPClient:         client,
+			})
 		},
 	}
+	a.connectionManager = connectionManager
 	return nil
 }
 
@@ -206,7 +210,7 @@ func (uploadsReq *UploadsReq) GetWhUploads(ctx context.Context) (uploadsRes *pro
 		return uploadsRes, nil
 	}
 
-	if UploadAPI.isMultiWorkspace {
+	if uploadsReq.API.isMultiWorkspace {
 		uploadsRes, err = uploadsReq.warehouseUploadsForHosted(ctx, authorizedSourceIDs, `id, source_id, destination_id, destination_type, namespace, status, error, first_event_at, last_event_at, last_exec_at, updated_at, timings, metadata->>'nextRetryTime', metadata->>'archivedStagingAndLoadFiles'`)
 		return
 	}
@@ -315,7 +319,7 @@ func (uploadReq *UploadReq) GetWHUpload(ctx context.Context) (*proto.WHUploadRes
 	}
 
 	if !uploadReq.authorizeSource(upload.SourceId) {
-		pkgLogger.Errorf(`Unauthorized request for upload:%d with sourceId:%s in workspaceId:%s`, uploadReq.UploadId, upload.SourceId, uploadReq.WorkspaceID)
+		uploadReq.API.log.Errorf(`Unauthorized request for upload:%d with sourceId:%s in workspaceId:%s`, uploadReq.UploadId, upload.SourceId, uploadReq.WorkspaceID)
 		return &proto.WHUploadResponse{}, status.Error(codes.Code(code.Code_UNAUTHENTICATED), "unauthorized request")
 	}
 
@@ -381,7 +385,7 @@ func (uploadReq *UploadReq) TriggerWHUpload(ctx context.Context) (response *prot
 		return
 	}
 
-	upload, err := repo.NewUploads(uploadReq.API.warehouseDBHandle.handle).Get(ctx, uploadReq.UploadId)
+	upload, err := repo.NewUploads(uploadReq.API.warehouseDBHandle).Get(ctx, uploadReq.UploadId)
 	if err == model.ErrUploadNotFound {
 		return &proto.TriggerWhUploadsResponse{
 			Message:    NoSuchSync,
@@ -394,14 +398,14 @@ func (uploadReq *UploadReq) TriggerWHUpload(ctx context.Context) (response *prot
 	}
 
 	if !uploadReq.authorizeSource(upload.SourceID) {
-		pkgLogger.Errorf(`Unauthorized request for upload:%d with sourceId:%s in workspaceId:%s`, uploadReq.UploadId, upload.SourceID, uploadReq.WorkspaceID)
+		uploadReq.API.log.Errorf(`Unauthorized request for upload:%d with sourceId:%s in workspaceId:%s`, uploadReq.UploadId, upload.SourceID, uploadReq.WorkspaceID)
 		err = errors.New("unauthorized request")
 		return
 	}
 
 	uploadJobT := UploadJob{
 		upload:   upload,
-		dbHandle: uploadReq.API.warehouseDBHandle.handle,
+		dbHandle: uploadReq.API.warehouseDBHandle,
 		now:      timeutil.Now,
 		ctx:      ctx,
 	}

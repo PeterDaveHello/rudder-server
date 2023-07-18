@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/hashicorp/yamux"
 	"google.golang.org/grpc"
+
+	"github.com/hashicorp/yamux"
 
 	proto "github.com/rudderlabs/rudder-server/proto/common"
 )
@@ -50,19 +51,19 @@ func (cm *ConnectionManager) establishConnection() (*ConnHandler, error) {
 }
 
 func (c *ConnHandler) ServeOnConnection() error {
-	c.logger.Info("starting grpc server")
+	c.logger.Info("starting syncs server")
 	if err := c.GRPCServer.Serve(c.YamuxSess); err != nil {
-		return fmt.Errorf("failed to serve grpc: %w", err)
+		return fmt.Errorf("failed to serve syncs: %w", err)
 	}
 
 	return nil
 }
 
 func (c *ConnHandler) Close() error {
-	c.logger.Info("closing grpc connection")
+	c.logger.Info("closing syncs connection")
 	c.GRPCServer.GracefulStop()
 	if err := c.YamuxSess.Close(); err != nil {
-		return fmt.Errorf("failed to close grpc: %w", err)
+		return fmt.Errorf("failed to close syncs: %w", err)
 	}
 
 	return nil

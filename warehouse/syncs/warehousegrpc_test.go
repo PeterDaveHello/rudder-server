@@ -1,4 +1,4 @@
-package warehouse
+package syncs
 
 import (
 	"context"
@@ -6,16 +6,18 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/rudderlabs/rudder-server/warehouse"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	"github.com/ory/dockertest/v3"
 	"google.golang.org/genproto/googleapis/rpc/code"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/ory/dockertest/v3"
 
 	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
@@ -52,16 +54,16 @@ var _ = Describe("WarehouseGrpc", func() {
 				pool, err := dockertest.NewPool("")
 				Expect(err).To(BeNil())
 
-				pgResource = setupWarehouseJobs(pool, GinkgoT())
+				pgResource = warehouse.setupWarehouseJobs(pool, GinkgoT())
 
 				minioResource, err = destination.SetupMINIO(pool, cleanup)
 				Expect(err).To(BeNil())
 
 				By(fmt.Sprintf("minio:%s", minioResource.Endpoint))
 
-				initWarehouse()
+				warehouse.initWarehouse()
 
-				err = setupDB(c, getConnectionString())
+				err = warehouse.setupDB(c, warehouse.getConnectionString())
 				Expect(err).To(BeNil())
 
 				sqlStatement, err := os.ReadFile("testdata/sql/grpc_test.sql")
@@ -70,14 +72,14 @@ var _ = Describe("WarehouseGrpc", func() {
 				_, err = pgResource.DB.Exec(string(sqlStatement))
 				Expect(err).To(BeNil())
 
-				pkgLogger = logger.NOP
+				warehouse.pkgLogger = logger.NOP
 			})
 
 			BeforeEach(func() {
-				sourceIDsByWorkspace = map[string][]string{
+				warehouse.sourceIDsByWorkspace = map[string][]string{
 					workspaceID: {sourceID},
 				}
-				connectionsMap = map[string]map[string]model.Warehouse{
+				warehouse.connectionsMap = map[string]map[string]model.Warehouse{
 					destinationID: {
 						sourceID: model.Warehouse{
 							Identifier: warehouseutils.GetWarehouseIdentifier(destinationType, sourceID, destinationID),
@@ -120,7 +122,7 @@ var _ = Describe("WarehouseGrpc", func() {
 					Expect(err).NotTo(BeNil())
 				})
 				It("Unauthorized source", func() {
-					sourceIDsByWorkspace = map[string][]string{}
+					warehouse.sourceIDsByWorkspace = map[string][]string{}
 					_, err := w.GetWHUpload(c, req)
 
 					Expect(err).NotTo(BeNil())
@@ -150,7 +152,7 @@ var _ = Describe("WarehouseGrpc", func() {
 				})
 
 				It("Unauthorized source", func() {
-					sourceIDsByWorkspace = map[string][]string{}
+					warehouse.sourceIDsByWorkspace = map[string][]string{}
 
 					res, err := w.GetWHUploads(c, req)
 					Expect(err).To(BeNil())
@@ -241,7 +243,7 @@ var _ = Describe("WarehouseGrpc", func() {
 				})
 				It("Unauthorized source", func() {
 					req.IntervalInHours = 12
-					sourceIDsByWorkspace = map[string][]string{}
+					warehouse.sourceIDsByWorkspace = map[string][]string{}
 
 					res, err := w.CountWHUploadsToRetry(c, req)
 					Expect(err).NotTo(BeNil())
@@ -304,7 +306,7 @@ var _ = Describe("WarehouseGrpc", func() {
 				})
 				It("Unauthorized source", func() {
 					req.IntervalInHours = 12
-					sourceIDsByWorkspace = map[string][]string{}
+					warehouse.sourceIDsByWorkspace = map[string][]string{}
 
 					res, err := w.RetryWHUploads(c, req)
 					Expect(err).NotTo(BeNil())
@@ -348,7 +350,7 @@ var _ = Describe("WarehouseGrpc", func() {
 				})
 
 				It("Unauthorized source", func() {
-					sourceIDsByWorkspace = map[string][]string{}
+					warehouse.sourceIDsByWorkspace = map[string][]string{}
 
 					res, err := w.TriggerWHUpload(c, req)
 					Expect(err).NotTo(BeNil())
@@ -375,7 +377,7 @@ var _ = Describe("WarehouseGrpc", func() {
 				})
 
 				It("Unauthorized source", func() {
-					sourceIDsByWorkspace = map[string][]string{}
+					warehouse.sourceIDsByWorkspace = map[string][]string{}
 
 					res, err := w.TriggerWHUploads(c, req)
 					Expect(err).NotTo(BeNil())
@@ -559,11 +561,11 @@ var _ = Describe("WarehouseGrpc", func() {
 				g.Setenv("DEPLOYMENT_TYPE", "MULTITENANT")
 				g.Setenv("HOSTED_SERVICE_SECRET", "test-secret")
 
-				pgResource = setupWarehouseJobs(pool, g)
+				pgResource = warehouse.setupWarehouseJobs(pool, g)
 
-				initWarehouse()
+				warehouse.initWarehouse()
 
-				err = setupDB(c, getConnectionString())
+				err = warehouse.setupDB(c, warehouse.getConnectionString())
 				Expect(err).To(BeNil())
 
 				sqlStatement, err := os.ReadFile("testdata/sql/grpc_test.sql")
@@ -572,11 +574,11 @@ var _ = Describe("WarehouseGrpc", func() {
 				_, err = pgResource.DB.Exec(string(sqlStatement))
 				Expect(err).To(BeNil())
 
-				pkgLogger = logger.NOP
-				sourceIDsByWorkspace = map[string][]string{
+				warehouse.pkgLogger = logger.NOP
+				warehouse.sourceIDsByWorkspace = map[string][]string{
 					workspaceID: {sourceID},
 				}
-				connectionsMap = map[string]map[string]model.Warehouse{
+				warehouse.connectionsMap = map[string]map[string]model.Warehouse{
 					destinationID: {
 						sourceID: model.Warehouse{
 							Identifier: warehouseutils.GetWarehouseIdentifier(destinationType, sourceID, destinationID),

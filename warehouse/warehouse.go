@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rudderlabs/rudder-server/warehouse/syncs"
 	"github.com/samber/lo"
 
 	"github.com/rudderlabs/rudder-server/warehouse/logfield"
@@ -1685,7 +1686,8 @@ func Start(ctx context.Context, app app.App) error {
 			rruntime.GoForWarehouse(func() {
 				minimalConfigSubscriber(ctx)
 			})
-			err := InitWarehouseAPI(dbHandle, pkgLogger.Child("upload_api"))
+			uploadAPI := syncs.Setup(dbHandle, wrappedDBHandle, config.Default, pkgLogger)
+			uploadAPI.Start()
 			if err != nil {
 				pkgLogger.Errorf("WH: Failed to start warehouse api: %v", err)
 				return err
@@ -1786,7 +1788,6 @@ func Start(ctx context.Context, app app.App) error {
 			return nil
 		}))
 
-		err := InitWarehouseAPI(dbHandle, pkgLogger.Child("upload_api"))
 		if err != nil {
 			pkgLogger.Errorf("WH: Failed to start warehouse api: %v", err)
 			return err

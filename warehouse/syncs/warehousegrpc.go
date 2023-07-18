@@ -1,4 +1,4 @@
-package warehouse
+package syncs
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	proto "github.com/rudderlabs/rudder-server/proto/warehouse"
+	"github.com/rudderlabs/rudder-server/warehouse"
 	"github.com/rudderlabs/rudder-server/warehouse/client/controlplane"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
@@ -160,7 +161,7 @@ func (grpc *warehouseGRPC) Validate(ctx context.Context, req *proto.WHValidation
 }
 
 func (*warehouseGRPC) RetryWHUploads(ctx context.Context, req *proto.RetryWHUploadsRequest) (response *proto.RetryWHUploadsResponse, err error) {
-	retryReq := &RetryRequest{
+	retryReq := &warehouse.RetryRequest{
 		WorkspaceID:     req.WorkspaceId,
 		SourceID:        req.SourceId,
 		DestinationID:   req.DestinationId,
@@ -237,7 +238,7 @@ func (*warehouseGRPC) ValidateObjectStorageDestination(ctx context.Context, requ
 	err = validateObjectStorage(ctx, r)
 	if err != nil {
 
-		if errors.As(err, &InvalidDestinationCredErr{}) {
+		if errors.As(err, &warehouse.InvalidDestinationCredErr{}) {
 			return &proto.ValidateObjectStorageResponse{
 				IsValid: false,
 				Error:   err.Error(),
@@ -255,7 +256,7 @@ func (*warehouseGRPC) ValidateObjectStorageDestination(ctx context.Context, requ
 }
 
 func (*warehouseGRPC) CountWHUploadsToRetry(ctx context.Context, req *proto.RetryWHUploadsRequest) (response *proto.RetryWHUploadsResponse, err error) {
-	retryReq := &RetryRequest{
+	retryReq := &warehouse.RetryRequest{
 		WorkspaceID:     req.WorkspaceId,
 		SourceID:        req.SourceId,
 		DestinationID:   req.DestinationId,
