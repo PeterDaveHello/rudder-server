@@ -49,44 +49,112 @@ import (
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
 
+type App struct {
+	application app.App
+	conf        *config.Config
+	logger      logger.Logger
+	stats       stats.Stats
+
+	dbHandle        *sql.DB
+	wrappedDBHandle *sqlquerywrapper.DB
+
+	notifier           pgnotifier.PGNotifier
+	tenantManager      *multitenant.Manager
+	controlPlaneClient *controlplane.Client
+	bcConfig           backendconfig.BackendConfig
+
+	bcManager *backendConfigManager
+	asyncJob  *jobs.AsyncJobWh
+
+	lastProcessedMarkerMap     map[string]int64
+	lastProcessedMarkerMapLock sync.RWMutex
+	triggerUploadsMap          map[string]bool // `whType:sourceID:destinationID` -> boolean value representing if an upload was triggered or not
+	triggerUploadsMapLock      sync.RWMutex
+
+	appName string
+
+	config struct {
+		host     string
+		user     string
+		password string
+		database string
+		sslMode  string
+		port     int
+
+		webPort int
+
+		noOfSlaveWorkerRoutines int
+		uploadFreqInS           int64
+
+		warehouseMode                       string
+		maxStagingFileReadBufferCapacityInK int
+
+		tableCountQueryTimeout     time.Duration
+		runningMode                string
+		shouldForceSetLowerVersion bool
+
+		dbHandleTimeout time.Duration
+
+		configBackendURL string
+		region           string
+
+		maxOpenConnections int
+	}
+}
+
+func NewApp(
+	ctx context.Context,
+	app app.App,
+	conf *config.Config,
+	log logger.Logger,
+	stats stats.Stats,
+) *App {
+	a := &App{}
+
+	a.application = app
+	a.conf = conf
+	a.logger = log
+	a.stats = stats
+	a.triggerUploadsMap = map[string]bool{}
+
+	a.conf.RegisterIntConfigVariable(4, &a.config.noOfSlaveWorkerRoutines, true, 1, "Warehouse.noOfSlaveWorkerRoutines")
+	a.conf.RegisterInt64ConfigVariable(1800, &a.config.uploadFreqInS, true, 1, "Warehouse.uploadFreqInS")
+	a.conf.RegisterIntConfigVariable(10240, &a.config.maxStagingFileReadBufferCapacityInK, true, 1, "Warehouse.maxStagingFileReadBufferCapacityInK")
+	a.conf.RegisterDurationConfigVariable(30, &a.config.tableCountQueryTimeout, true, time.Second, []string{"Warehouse.tableCountQueryTimeout", "Warehouse.tableCountQueryTimeoutInS"}...)
+	a.conf.RegisterDurationConfigVariable(5, &a.config.dbHandleTimeout, true, time.Minute, []string{"Warehouse.dbHandleTimeout", "Warehouse.dbHanndleTimeoutInMin"}...)
+
+	a.config.host = conf.GetString("WAREHOUSE_JOBS_DB_HOST", "localhost")
+	a.config.user = conf.GetString("WAREHOUSE_JOBS_DB_USER", "ubuntu")
+	a.config.database = conf.GetString("WAREHOUSE_JOBS_DB_DB_NAME", "ubuntu")
+	a.config.port = conf.GetInt("WAREHOUSE_JOBS_DB_PORT", 5432)
+	a.config.password = conf.GetString("WAREHOUSE_JOBS_DB_PASSWORD", "ubuntu") // Reading secrets from
+	a.config.sslMode = conf.GetString("WAREHOUSE_JOBS_DB_SSL_MODE", "disable")
+	a.config.maxOpenConnections = conf.GetInt("Warehouse.maxOpenConnections", 20)
+	a.config.runningMode = conf.GetString("Warehouse.runningMode", "")
+	a.config.configBackendURL = conf.GetString("CONFIG_BACKEND_URL", "https://api.rudderstack.com")
+	a.config.region = conf.GetString("region", "")
+	a.config.webPort = conf.GetInt("Warehouse.webPort", 8082)
+	a.config.warehouseMode = conf.GetString("Warehouse.mode", "embedded")
+	a.config.shouldForceSetLowerVersion = conf.GetBool("SQLMigrator.forceSetLowerVersion", true)
+
+	a.appName = misc.DefaultString("rudder-server").OnError(os.Hostname())
+
+	return a
+}
+
 var (
 	application                         app.App
-	webPort                             int
-	dbHandle                            *sql.DB
 	wrappedDBHandle                     *sqlquerywrapper.DB
-	dbHandleTimeout                     time.Duration
 	notifier                            pgnotifier.PGNotifier
 	tenantManager                       *multitenant.Manager
-	controlPlaneClient                  *controlplane.Client
 	noOfSlaveWorkerRoutines             int
 	uploadFreqInS                       int64
 	lastProcessedMarkerMap              map[string]int64
 	lastProcessedMarkerExp              = expvar.NewMap("lastProcessedMarkerMap")
 	lastProcessedMarkerMapLock          sync.RWMutex
-	warehouseMode                       string
 	maxStagingFileReadBufferCapacityInK int
 	bcManager                           *backendConfigManager
-	triggerUploadsMap                   map[string]bool // `whType:sourceID:destinationID` -> boolean value representing if an upload was triggered or not
-	triggerUploadsMapLock               sync.RWMutex
-	longRunningUploadStatThresholdInMin time.Duration
 	pkgLogger                           logger.Logger
-	tableCountQueryTimeout              time.Duration
-	runningMode                         string
-	ShouldForceSetLowerVersion          bool
-	asyncWh                             *jobs.AsyncJobWh
-)
-
-var (
-	host, user, password, dbname, sslMode, appName string
-	port                                           int
-)
-
-var defaultUploadPriority = 100
-
-// warehouses worker modes
-const (
-	EmbeddedMode       = "embedded"
-	EmbeddedMasterMode = "embedded_master"
 )
 
 const (
@@ -106,43 +174,11 @@ func Init4() {
 
 func loadConfig() {
 	// Port where WH is running
-	config.RegisterIntConfigVariable(8082, &webPort, false, 1, "Warehouse.webPort")
 	config.RegisterIntConfigVariable(4, &noOfSlaveWorkerRoutines, true, 1, "Warehouse.noOfSlaveWorkerRoutines")
 	config.RegisterInt64ConfigVariable(1800, &uploadFreqInS, true, 1, "Warehouse.uploadFreqInS")
 	lastProcessedMarkerMap = map[string]int64{}
-	config.RegisterStringConfigVariable("embedded", &warehouseMode, false, "Warehouse.mode")
-	host = config.GetString("WAREHOUSE_JOBS_DB_HOST", "localhost")
-	user = config.GetString("WAREHOUSE_JOBS_DB_USER", "ubuntu")
-	dbname = config.GetString("WAREHOUSE_JOBS_DB_DB_NAME", "ubuntu")
-	port = config.GetInt("WAREHOUSE_JOBS_DB_PORT", 5432)
-	password = config.GetString("WAREHOUSE_JOBS_DB_PASSWORD", "ubuntu") // Reading secrets from
-	sslMode = config.GetString("WAREHOUSE_JOBS_DB_SSL_MODE", "disable")
-	triggerUploadsMap = map[string]bool{}
+
 	config.RegisterIntConfigVariable(10240, &maxStagingFileReadBufferCapacityInK, true, 1, "Warehouse.maxStagingFileReadBufferCapacityInK")
-	config.RegisterDurationConfigVariable(120, &longRunningUploadStatThresholdInMin, true, time.Minute, []string{"Warehouse.longRunningUploadStatThreshold", "Warehouse.longRunningUploadStatThresholdInMin"}...)
-	runningMode = config.GetString("Warehouse.runningMode", "")
-	config.RegisterBoolConfigVariable(true, &ShouldForceSetLowerVersion, false, "SQLMigrator.forceSetLowerVersion")
-	config.RegisterDurationConfigVariable(30, &tableCountQueryTimeout, true, time.Second, []string{"Warehouse.tableCountQueryTimeout", "Warehouse.tableCountQueryTimeoutInS"}...)
-	config.RegisterDurationConfigVariable(5, &dbHandleTimeout, true, time.Minute, []string{"Warehouse.dbHandleTimeout", "Warehouse.dbHanndleTimeoutInMin"}...)
-
-	appName = misc.DefaultString("rudder-server").OnError(os.Hostname())
-}
-
-func getDestinationFromSlaveConnectionMap(destinationId, sourceId string) (model.Warehouse, error) {
-	if destinationId == "" || sourceId == "" {
-		return model.Warehouse{}, errors.New("invalid Parameters")
-	}
-	sourceMap, ok := bcManager.ConnectionSourcesMap(destinationId)
-	if !ok {
-		return model.Warehouse{}, errors.New("invalid Destination Id")
-	}
-
-	conn, ok := sourceMap[sourceId]
-	if !ok {
-		return model.Warehouse{}, errors.New("invalid Source Id")
-	}
-
-	return conn, nil
 }
 
 func getUploadFreqInS(syncFrequency string) int64 {
@@ -175,12 +211,12 @@ func getBucketFolder(batchID, tableName string) string {
 }
 
 // Gets the config from config backend and extracts enabled write keys
-func monitorDestRouters(ctx context.Context) error {
+func (a *App) monitorDestRouters(ctx context.Context) error {
 	dstToWhRouter := make(map[string]*Router)
 
-	ch := tenantManager.WatchConfig(ctx)
+	ch := a.tenantManager.WatchConfig(ctx)
 	for configData := range ch {
-		err := onConfigDataEvent(ctx, configData, dstToWhRouter)
+		err := a.onConfigDataEvent(ctx, configData, dstToWhRouter)
 		if err != nil {
 			return err
 		}
@@ -194,7 +230,7 @@ func monitorDestRouters(ctx context.Context) error {
 	return g.Wait()
 }
 
-func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.ConfigT, dstToWhRouter map[string]*Router) error {
+func (a *App) onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.ConfigT, dstToWhRouter map[string]*Router) error {
 	enabledDestinations := make(map[string]bool)
 	for _, wConfig := range configMap {
 		for _, source := range wConfig.Sources {
@@ -203,25 +239,25 @@ func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.C
 				if slices.Contains(warehouseutils.WarehouseDestinations, destination.DestinationDefinition.Name) {
 					router, ok := dstToWhRouter[destination.DestinationDefinition.Name]
 					if !ok {
-						pkgLogger.Info("Starting a new Warehouse Destination Router: ", destination.DestinationDefinition.Name)
+						a.logger.Info("Starting a new Warehouse Destination Router: ", destination.DestinationDefinition.Name)
 						router, err := NewRouter(
 							ctx,
 							destination.DestinationDefinition.Name,
-							config.Default,
-							pkgLogger,
-							stats.Default,
-							wrappedDBHandle,
-							notifier,
-							tenantManager,
-							controlPlaneClient,
-							bcManager,
+							a.conf,
+							a.logger,
+							a.stats,
+							a.wrappedDBHandle,
+							a.notifier,
+							a.tenantManager,
+							a.controlPlaneClient,
+							a.bcManager,
 						)
 						if err != nil {
 							return fmt.Errorf("setup warehouse %q: %w", destination.DestinationDefinition.Name, err)
 						}
 						dstToWhRouter[destination.DestinationDefinition.Name] = router
 					} else {
-						pkgLogger.Debug("Enabling existing Destination: ", destination.DestinationDefinition.Name)
+						a.logger.Debug("Enabling existing Destination: ", destination.DestinationDefinition.Name)
 						router.Enable()
 					}
 				}
@@ -233,7 +269,7 @@ func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.C
 	for _, key := range keys {
 		if _, ok := enabledDestinations[key]; !ok {
 			if wh, ok := dstToWhRouter[key]; ok {
-				pkgLogger.Info("Disabling a existing warehouse destination: ", key)
+				a.logger.Info("Disabling a existing warehouse destination: ", key)
 				wh.Disable()
 			}
 		}
@@ -242,11 +278,11 @@ func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.C
 	return nil
 }
 
-func setupTables(dbHandle *sql.DB) error {
+func (a *App) setupTables() error {
 	m := &migrator.Migrator{
-		Handle:                     dbHandle,
+		Handle:                     a.dbHandle,
 		MigrationsTable:            "wh_schema_migrations",
-		ShouldForceSetLowerVersion: ShouldForceSetLowerVersion,
+		ShouldForceSetLowerVersion: a.config.shouldForceSetLowerVersion,
 	}
 
 	operation := func() error {
@@ -255,7 +291,7 @@ func setupTables(dbHandle *sql.DB) error {
 
 	backoffWithMaxRetry := backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 3)
 	err := backoff.RetryNotify(operation, backoffWithMaxRetry, func(err error, t time.Duration) {
-		pkgLogger.Warnf("Failed to setup WH db tables: %v, retrying after %v", err, t)
+		a.logger.Warnf("Failed to setup WH db tables: %v, retrying after %v", err, t)
 	})
 	if err != nil {
 		return fmt.Errorf("could not run warehouse database migrations: %w", err)
@@ -263,7 +299,7 @@ func setupTables(dbHandle *sql.DB) error {
 	return nil
 }
 
-func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
+func (a *App) pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// TODO : respond with errors in a common way
 	pkgLogger.LogRequest(r)
 
@@ -271,7 +307,7 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// read body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error reading body: %v", err)
+		a.logger.Errorf("[WH]: Error reading body: %v", err)
 		http.Error(w, "can't read body", http.StatusBadRequest)
 		return
 	}
@@ -281,7 +317,7 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 	var pendingEventsReq warehouseutils.PendingEventsRequest
 	err = json.Unmarshal(body, &pendingEventsReq)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error unmarshalling body: %v", err)
+		a.logger.Errorf("[WH]: Error unmarshalling body: %v", err)
 		http.Error(w, "can't unmarshall body", http.StatusBadRequest)
 		return
 	}
@@ -289,20 +325,20 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 	sourceID, taskRunID := pendingEventsReq.SourceID, pendingEventsReq.TaskRunID
 	// return error if source id is empty
 	if sourceID == "" || taskRunID == "" {
-		pkgLogger.Errorf("empty source_id or task_run_id in the pending events request")
+		a.logger.Errorf("empty source_id or task_run_id in the pending events request")
 		http.Error(w, "empty source_id or task_run_id", http.StatusBadRequest)
 		return
 	}
 
-	workspaceID, err := tenantManager.SourceToWorkspace(ctx, sourceID)
+	workspaceID, err := a.tenantManager.SourceToWorkspace(ctx, sourceID)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error checking if source is degraded: %v", err)
+		a.logger.Errorf("[WH]: Error checking if source is degraded: %v", err)
 		http.Error(w, "workspaceID from sourceID not found", http.StatusBadRequest)
 		return
 	}
 
-	if tenantManager.DegradedWorkspace(workspaceID) {
-		pkgLogger.Infof("[WH]: Workspace (id: %q) is degraded: %v", workspaceID, err)
+	if a.tenantManager.DegradedWorkspace(workspaceID) {
+		a.logger.Infof("[WH]: Workspace (id: %q) is degraded: %v", workspaceID, err)
 		http.Error(w, "workspace is in degraded mode", http.StatusServiceUnavailable)
 		return
 	}
@@ -315,10 +351,10 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// check whether there are any pending staging files or uploads for the given source id
 	// get pending staging files
-	pendingStagingFileCount, err = repo.NewStagingFiles(wrappedDBHandle).CountPendingForSource(ctx, sourceID)
+	pendingStagingFileCount, err = repo.NewStagingFiles(a.wrappedDBHandle).CountPendingForSource(ctx, sourceID)
 	if err != nil {
 		err := fmt.Errorf("error getting pending staging file count : %v", err)
-		pkgLogger.Errorf("[WH]: %v", err)
+		a.logger.Errorf("[WH]: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -330,10 +366,10 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 		{Key: "status", NotEquals: true, Value: model.Aborted},
 	}
 
-	pendingUploadCount, err = getFilteredCount(ctx, filters...)
+	pendingUploadCount, err = repo.NewUploads(a.wrappedDBHandle).Count(ctx, filters...)
 
 	if err != nil {
-		pkgLogger.Errorf("getting pending uploads count", "error", err)
+		a.logger.Errorf("getting pending uploads count", "error", err)
 		http.Error(w, fmt.Sprintf(
 			"getting pending uploads count: %s", err.Error()),
 			http.StatusInternalServerError)
@@ -346,9 +382,9 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 		{Key: "status", Value: "aborted"},
 	}
 
-	abortedUploadCount, err := getFilteredCount(ctx, filters...)
+	abortedUploadCount, err := repo.NewUploads(a.wrappedDBHandle).Count(ctx, filters...)
 	if err != nil {
-		pkgLogger.Errorf("getting aborted uploads count", "error", err.Error())
+		a.logger.Errorf("getting aborted uploads count", "error", err.Error())
 		http.Error(w, fmt.Sprintf("getting aborted uploads count: %s", err), http.StatusInternalServerError)
 		return
 	}
@@ -367,20 +403,20 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// trigger upload if there are pending events and triggerPendingUpload is true
 	if pendingEvents && triggerPendingUpload {
-		pkgLogger.Infof("[WH]: Triggering upload for all wh destinations connected to source '%s'", sourceID)
+		a.logger.Infof("[WH]: Triggering upload for all wh destinations connected to source '%s'", sourceID)
 
 		wh := bcManager.WarehousesBySourceID(sourceID)
 
 		// return error if no such destinations found
 		if len(wh) == 0 {
 			err := fmt.Errorf("no warehouse destinations found for source id '%s'", sourceID)
-			pkgLogger.Errorf("[WH]: %v", err)
+			a.logger.Errorf("[WH]: %v", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		for _, warehouse := range wh {
-			triggerUpload(warehouse)
+			a.triggerUpload(warehouse)
 		}
 	}
 
@@ -395,7 +431,7 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 	resBody, err := json.Marshal(res)
 	if err != nil {
 		err := fmt.Errorf("failed to marshall pending events response : %v", err)
-		pkgLogger.Errorf("[WH]: %v", err)
+		a.logger.Errorf("[WH]: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -403,52 +439,16 @@ func pendingEventsHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(resBody)
 }
 
-func getFilteredCount(ctx context.Context, filters ...repo.FilterBy) (int64, error) {
-	pkgLogger.Debugf("fetching filtered count")
-	return repo.NewUploads(wrappedDBHandle).Count(ctx, filters...)
-}
-
-func getPendingUploadCount(filters ...warehouseutils.FilterBy) (uploadCount int64, err error) {
-	pkgLogger.Debugf("Fetching pending upload count with filters: %v", filters)
-
-	query := fmt.Sprintf(`
-		SELECT
-		  COUNT(*)
-		FROM
-		  %[1]s
-		WHERE
-		  %[1]s.status NOT IN ('%[2]s', '%[3]s')
-	`,
-		warehouseutils.WarehouseUploadsTable,
-		model.ExportedData,
-		model.Aborted,
-	)
-
-	args := make([]interface{}, 0)
-	for i, filter := range filters {
-		query += fmt.Sprintf(" AND %s=$%d", filter.Key, i+1)
-		args = append(args, filter.Value)
-	}
-
-	err = wrappedDBHandle.QueryRow(query, args...).Scan(&uploadCount)
-	if err != nil && err != sql.ErrNoRows {
-		err = fmt.Errorf("query: %s failed with Error : %w", query, err)
-		return
-	}
-
-	return uploadCount, nil
-}
-
-func triggerUploadHandler(w http.ResponseWriter, r *http.Request) {
+func (a *App) triggerUploadHandler(w http.ResponseWriter, r *http.Request) {
 	// TODO : respond with errors in a common way
-	pkgLogger.LogRequest(r)
+	a.logger.LogRequest(r)
 
 	ctx := r.Context()
 
 	// read body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error reading body: %v", err)
+		a.logger.Errorf("[WH]: Error reading body: %v", err)
 		http.Error(w, "can't read body", http.StatusBadRequest)
 		return
 	}
@@ -458,25 +458,25 @@ func triggerUploadHandler(w http.ResponseWriter, r *http.Request) {
 	var triggerUploadReq warehouseutils.TriggerUploadRequest
 	err = json.Unmarshal(body, &triggerUploadReq)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error unmarshalling body: %v", err)
+		a.logger.Errorf("[WH]: Error unmarshalling body: %v", err)
 		http.Error(w, "can't unmarshall body", http.StatusBadRequest)
 		return
 	}
 
 	workspaceID, err := tenantManager.SourceToWorkspace(ctx, triggerUploadReq.SourceID)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error checking if source is degraded: %v", err)
+		a.logger.Errorf("[WH]: Error checking if source is degraded: %v", err)
 		http.Error(w, "workspaceID from sourceID not found", http.StatusBadRequest)
 		return
 	}
 
 	if tenantManager.DegradedWorkspace(workspaceID) {
-		pkgLogger.Infof("[WH]: Workspace (id: %q) is degraded: %v", workspaceID, err)
+		a.logger.Infof("[WH]: Workspace (id: %q) is degraded: %v", workspaceID, err)
 		http.Error(w, "workspace is in degraded mode", http.StatusServiceUnavailable)
 		return
 	}
 
-	err = TriggerUploadHandler(triggerUploadReq.SourceID, triggerUploadReq.DestinationID)
+	err = a.TriggerUploadHandler(triggerUploadReq.SourceID, triggerUploadReq.DestinationID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -484,11 +484,11 @@ func triggerUploadHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func TriggerUploadHandler(sourceID, destID string) error {
+func (a *App) TriggerUploadHandler(sourceID, destID string) error {
 	// return error if source id and dest id is empty
 	if sourceID == "" && destID == "" {
 		err := fmt.Errorf("empty source and destination id")
-		pkgLogger.Errorf("[WH]: trigger upload : %v", err)
+		a.logger.Errorf("[WH]: trigger upload : %v", err)
 		return err
 	}
 
@@ -503,24 +503,24 @@ func TriggerUploadHandler(sourceID, destID string) error {
 	// return error if no such destinations found
 	if len(wh) == 0 {
 		err := fmt.Errorf("no warehouse destinations found for source id '%s'", sourceID)
-		pkgLogger.Errorf("[WH]: %v", err)
+		a.logger.Errorf("[WH]: %v", err)
 		return err
 	}
 
 	// iterate over each wh destination and trigger upload
 	for _, warehouse := range wh {
-		triggerUpload(warehouse)
+		a.triggerUpload(warehouse)
 	}
 	return nil
 }
 
-func fetchTablesHandler(w http.ResponseWriter, r *http.Request) {
+func (a *App) fetchTablesHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	defer func() { _ = r.Body.Close() }()
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error reading body: %v", err)
+		a.logger.Errorf("[WH]: Error reading body: %v", err)
 		http.Error(w, "can't read body", http.StatusBadRequest)
 		return
 	}
@@ -528,15 +528,15 @@ func fetchTablesHandler(w http.ResponseWriter, r *http.Request) {
 	var connectionsTableRequest warehouseutils.FetchTablesRequest
 	err = json.Unmarshal(body, &connectionsTableRequest)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error unmarshalling body: %v", err)
+		a.logger.Errorf("[WH]: Error unmarshalling body: %v", err)
 		http.Error(w, "can't unmarshall body", http.StatusBadRequest)
 		return
 	}
 
-	schemaRepo := repo.NewWHSchemas(wrappedDBHandle)
+	schemaRepo := repo.NewWHSchemas(a.wrappedDBHandle)
 	tables, err := schemaRepo.GetTablesForConnection(ctx, connectionsTableRequest.Connections)
 	if err != nil {
-		pkgLogger.Errorf("[WH]: Error fetching tables: %v", err)
+		a.logger.Errorf("[WH]: Error fetching tables: %v", err)
 		http.Error(w, "can't fetch tables from schemas repo", http.StatusInternalServerError)
 		return
 	}
@@ -545,7 +545,7 @@ func fetchTablesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		err := fmt.Errorf("failed to marshall tables to response : %v", err)
-		pkgLogger.Errorf("[WH]: %v", err)
+		a.logger.Errorf("[WH]: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -553,41 +553,41 @@ func fetchTablesHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(resBody)
 }
 
-func isUploadTriggered(wh model.Warehouse) bool {
-	triggerUploadsMapLock.RLock()
-	defer triggerUploadsMapLock.RUnlock()
-	return triggerUploadsMap[wh.Identifier]
+func (a *App) isUploadTriggered(wh model.Warehouse) bool {
+	a.triggerUploadsMapLock.RLock()
+	defer a.triggerUploadsMapLock.RUnlock()
+	return a.triggerUploadsMap[wh.Identifier]
 }
 
-func triggerUpload(wh model.Warehouse) {
-	triggerUploadsMapLock.Lock()
-	defer triggerUploadsMapLock.Unlock()
-	pkgLogger.Infof("[WH]: Upload triggered for warehouse '%s'", wh.Identifier)
-	triggerUploadsMap[wh.Identifier] = true
+func (a *App) triggerUpload(wh model.Warehouse) {
+	a.triggerUploadsMapLock.Lock()
+	defer a.triggerUploadsMapLock.Unlock()
+	a.logger.Infof("[WH]: Upload triggered for warehouse '%s'", wh.Identifier)
+	a.triggerUploadsMap[wh.Identifier] = true
 }
 
-func clearTriggeredUpload(wh model.Warehouse) {
-	triggerUploadsMapLock.Lock()
-	defer triggerUploadsMapLock.Unlock()
-	delete(triggerUploadsMap, wh.Identifier)
+func (a *App) clearTriggeredUpload(wh model.Warehouse) {
+	a.triggerUploadsMapLock.Lock()
+	defer a.triggerUploadsMapLock.Unlock()
+	delete(a.triggerUploadsMap, wh.Identifier)
 }
 
-func healthHandler(w http.ResponseWriter, _ *http.Request) {
+func (a *App) healthHandler(w http.ResponseWriter, _ *http.Request) {
 	var dbService, pgNotifierService string
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if runningMode != DegradedMode {
-		if !CheckPGHealth(ctx, notifier.GetDBHandle()) {
+	if a.config.runningMode != DegradedMode {
+		if !a.checkPGHealth(ctx, notifier.GetDBHandle()) {
 			http.Error(w, "Cannot connect to pgNotifierService", http.StatusInternalServerError)
 			return
 		}
 		pgNotifierService = "UP"
 	}
 
-	if isMaster() {
-		if !CheckPGHealth(ctx, dbHandle) {
+	if a.isMaster() {
+		if !a.checkPGHealth(ctx, a.dbHandle) {
 			http.Error(w, "Cannot connect to dbService", http.StatusInternalServerError)
 			return
 		}
@@ -606,14 +606,14 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	`,
 		dbService,
 		pgNotifierService,
-		strings.ToUpper(warehouseMode),
+		strings.ToUpper(a.config.warehouseMode),
 		runtime.NumGoroutine(),
 	)
 
 	_, _ = w.Write([]byte(healthVal))
 }
 
-func CheckPGHealth(ctx context.Context, db *sql.DB) bool {
+func (a *App) checkPGHealth(ctx context.Context, db *sql.DB) bool {
 	if db == nil {
 		return false
 	}
@@ -629,56 +629,62 @@ func CheckPGHealth(ctx context.Context, db *sql.DB) bool {
 	return healthCheckMsg == msg
 }
 
-func getConnectionString() string {
-	if !CheckForWarehouseEnvVars() {
+func (a *App) connectionString() string {
+	if !a.checkForWarehouseEnvVars() {
 		return misc.GetConnectionString()
 	}
-	return fmt.Sprintf("host=%s port=%d user=%s "+
-		"password=%s dbname=%s sslmode=%s application_name=%s",
-		host, port, user, password, dbname, sslMode, appName)
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s application_name=%s",
+		a.config.host,
+		a.config.port,
+		a.config.user,
+		a.config.password,
+		a.config.database,
+		a.config.sslMode,
+		a.appName,
+	)
 }
 
-func startWebHandler(ctx context.Context) error {
+func (a *App) startWebHandler(ctx context.Context) error {
 	srvMux := chi.NewRouter()
 
 	// do not register same endpoint when running embedded in rudder backend
-	if isStandAlone() {
-		srvMux.Get("/health", healthHandler)
+	if a.isStandAlone() {
+		srvMux.Get("/health", a.healthHandler)
 	}
-	if runningMode != DegradedMode {
-		if isMaster() {
-			pkgLogger.Infof("WH: Warehouse master service waiting for BackendConfig before starting on %d", webPort)
-			backendconfig.DefaultBackendConfig.WaitForConfig(ctx)
+	if a.config.runningMode != DegradedMode {
+		if a.isMaster() {
+			a.logger.Infof("WH: Warehouse master service waiting for BackendConfig before starting on %d", a.config.webPort)
+			a.bcConfig.WaitForConfig(ctx)
 
 			srvMux.Handle("/v1/process", (&api.WarehouseAPI{
-				Logger:      pkgLogger,
-				Stats:       stats.Default,
-				Repo:        repo.NewStagingFiles(wrappedDBHandle),
-				Multitenant: tenantManager,
+				Logger:      a.logger,
+				Stats:       a.stats,
+				Repo:        repo.NewStagingFiles(a.wrappedDBHandle),
+				Multitenant: a.tenantManager,
 			}).Handler())
 
 			// triggers upload only when there are pending events and triggerUpload is sent for a sourceId
-			srvMux.Post("/v1/warehouse/pending-events", pendingEventsHandler)
+			srvMux.Post("/v1/warehouse/pending-events", a.pendingEventsHandler)
 			// triggers uploads for a source
-			srvMux.Post("/v1/warehouse/trigger-upload", triggerUploadHandler)
+			srvMux.Post("/v1/warehouse/trigger-upload", a.triggerUploadHandler)
 
 			// Warehouse Async Job end-points
-			srvMux.Post("/v1/warehouse/jobs", asyncWh.AddWarehouseJobHandler)          // FIXME: add degraded mode
-			srvMux.Get("/v1/warehouse/jobs/status", asyncWh.StatusWarehouseJobHandler) // FIXME: add degraded mode
+			srvMux.Post("/v1/warehouse/jobs", a.asyncJob.AddWarehouseJobHandler)          // FIXME: add degraded mode
+			srvMux.Get("/v1/warehouse/jobs/status", a.asyncJob.StatusWarehouseJobHandler) // FIXME: add degraded mode
 
 			// fetch schema info
 			// TODO: Remove this endpoint once sources change is released
-			srvMux.Get("/v1/warehouse/fetch-tables", fetchTablesHandler)
-			srvMux.Get("/internal/v1/warehouse/fetch-tables", fetchTablesHandler)
+			srvMux.Get("/v1/warehouse/fetch-tables", a.fetchTablesHandler)
+			srvMux.Get("/internal/v1/warehouse/fetch-tables", a.fetchTablesHandler)
 
-			pkgLogger.Infof("WH: Starting warehouse master service in %d", webPort)
+			pkgLogger.Infof("WH: Starting warehouse master service in %d", a.config.webPort)
 		} else {
-			pkgLogger.Infof("WH: Starting warehouse slave service in %d", webPort)
+			pkgLogger.Infof("WH: Starting warehouse slave service in %d", a.config.webPort)
 		}
 	}
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", webPort),
+		Addr:              fmt.Sprintf(":%d", a.config.webPort),
 		Handler:           bugsnag.Handler(srvMux),
 		ReadHeaderTimeout: 3 * time.Second,
 	}
@@ -686,133 +692,146 @@ func startWebHandler(ctx context.Context) error {
 	return kithttputil.ListenAndServe(ctx, srv)
 }
 
-// CheckForWarehouseEnvVars Checks if all the required Env Variables for Warehouse are present
-func CheckForWarehouseEnvVars() bool {
-	return config.IsSet("WAREHOUSE_JOBS_DB_HOST") &&
-		config.IsSet("WAREHOUSE_JOBS_DB_USER") &&
-		config.IsSet("WAREHOUSE_JOBS_DB_DB_NAME") &&
-		config.IsSet("WAREHOUSE_JOBS_DB_PASSWORD")
+// checkForWarehouseEnvVars Checks if all the required Env Variables for Warehouse are present
+func (a *App) checkForWarehouseEnvVars() bool {
+	return a.conf.IsSet("WAREHOUSE_JOBS_DB_HOST") &&
+		a.conf.IsSet("WAREHOUSE_JOBS_DB_USER") &&
+		a.conf.IsSet("WAREHOUSE_JOBS_DB_DB_NAME") &&
+		a.conf.IsSet("WAREHOUSE_JOBS_DB_PASSWORD")
 }
 
-// This checks if gateway is running or not
-func isStandAlone() bool {
-	return warehouseMode != EmbeddedMode && warehouseMode != EmbeddedMasterMode
-}
-
-func isMaster() bool {
-	return warehouseMode == config.MasterMode ||
-		warehouseMode == config.MasterSlaveMode ||
-		warehouseMode == config.EmbeddedMode ||
-		warehouseMode == config.EmbeddedMasterMode
-}
-
-func isSlave() bool {
-	return warehouseMode == config.SlaveMode || warehouseMode == config.MasterSlaveMode || warehouseMode == config.EmbeddedMode
-}
-
-func isStandAloneSlave() bool {
-	return warehouseMode == config.SlaveMode
-}
-
-func setupDB(ctx context.Context, connInfo string) error {
-	var err error
-	dbHandle, err = sql.Open("postgres", connInfo)
-	if err != nil {
-		return err
+// isStandAlone checks if gateway is running or not
+func (a *App) isStandAlone() bool {
+	switch a.config.warehouseMode {
+	case config.EmbeddedMode, config.EmbeddedMasterMode:
+		return false
+	default:
+		return true
 	}
-	dbHandle.SetMaxOpenConns(config.GetInt("Warehouse.maxOpenConnections", 20))
+}
 
-	isDBCompatible, err := validators.IsPostgresCompatible(ctx, dbHandle)
-	if err != nil {
-		return err
+func (a *App) isMaster() bool {
+	switch a.config.warehouseMode {
+	case config.MasterMode, config.MasterSlaveMode, config.EmbeddedMode, config.EmbeddedMasterMode:
+		return true
+	default:
+		return false
 	}
+}
 
-	if !isDBCompatible {
-		err := errors.New("rudder Warehouse Service needs postgres version >= 10. Exiting")
-		pkgLogger.Error(err)
-		return err
+func (a *App) isSlave() bool {
+	switch a.config.warehouseMode {
+	case config.SlaveMode, config.MasterSlaveMode, config.EmbeddedMode:
+		return true
+	default:
+		return false
 	}
+}
 
-	if err = dbHandle.PingContext(ctx); err != nil {
-		return fmt.Errorf("could not ping WH db: %w", err)
-	}
-
-	wrappedDBHandle = sqlquerywrapper.New(
-		dbHandle,
-		sqlquerywrapper.WithLogger(pkgLogger.Child("dbHandle")),
-		sqlquerywrapper.WithQueryTimeout(dbHandleTimeout),
-	)
-
-	return setupTables(dbHandle)
+func (a *App) isStandAloneSlave() bool {
+	return a.config.warehouseMode == config.SlaveMode
 }
 
 // Setup prepares the database connection for warehouse service, verifies database compatibility and creates the required tables
-func Setup(ctx context.Context) error {
+func (a *App) Setup(ctx context.Context) error {
 	if !db.IsNormalMode() {
 		return nil
 	}
-	psqlInfo := getConnectionString()
-	if err := setupDB(ctx, psqlInfo); err != nil {
+
+	if err := a.setupDB(ctx, a.connectionString()); err != nil {
 		return fmt.Errorf("cannot setup warehouse db: %w", err)
 	}
 	return nil
 }
 
-// Start starts the warehouse service
-func Start(ctx context.Context, app app.App) error {
-	application = app
+func (a *App) setupDB(ctx context.Context, connInfo string) error {
+	var err error
+	var db *sql.DB
 
-	if dbHandle == nil && !isStandAloneSlave() {
+	if db, err = sql.Open("postgres", connInfo); err != nil {
+		return fmt.Errorf("could not open WH db: %w", err)
+	}
+
+	db.SetMaxOpenConns(config.GetInt("Warehouse.maxOpenConnections", 20))
+
+	isDBCompatible, err := validators.IsPostgresCompatible(ctx, db)
+	if err != nil {
+		return fmt.Errorf("could not check WH db compatibility: %w", err)
+	}
+	if !isDBCompatible {
+		err := errors.New("rudder Warehouse Service needs postgres version >= 10. Exiting")
+		a.logger.Error(err)
+		return err
+	}
+
+	if err = db.PingContext(ctx); err != nil {
+		return fmt.Errorf("could not ping WH db: %w", err)
+	}
+
+	a.wrappedDBHandle = sqlquerywrapper.New(
+		a.dbHandle,
+		sqlquerywrapper.WithLogger(a.logger.Child("dbHandle")),
+		sqlquerywrapper.WithQueryTimeout(a.config.dbHandleTimeout),
+	)
+
+	return a.setupTables()
+}
+
+// Start starts the warehouse service
+func (a *App) Start(ctx context.Context, app app.App) error {
+	if a.dbHandle == nil && !a.isStandAloneSlave() {
 		return errors.New("warehouse service cannot start, database connection is not setup")
 	}
+
 	// do not start warehouse service if rudder core is not in normal mode and warehouse is running in same process as rudder core
-	if !isStandAlone() && !db.IsNormalMode() {
-		pkgLogger.Infof("Skipping start of warehouse service...")
+	if !a.isStandAlone() && !db.IsNormalMode() {
+		a.logger.Infof("Skipping start of warehouse service...")
 		return nil
 	}
 
-	pkgLogger.Infof("WH: Starting Warehouse service...")
-	psqlInfo := getConnectionString()
+	a.logger.Infof("WH: Starting Warehouse service...")
+
+	psqlInfo := a.connectionString()
 
 	defer func() {
 		if r := recover(); r != nil {
-			pkgLogger.Fatal(r)
+			a.logger.Fatal(r)
 			panic(r)
 		}
 	}()
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	tenantManager = &multitenant.Manager{
-		BackendConfig: backendconfig.DefaultBackendConfig,
+	a.tenantManager = &multitenant.Manager{
+		BackendConfig: a.bcConfig,
 	}
 	g.Go(func() error {
-		tenantManager.Run(ctx)
+		a.tenantManager.Run(ctx)
 		return nil
 	})
 
-	bcManager = newBackendConfigManager(
-		config.Default, wrappedDBHandle, tenantManager,
-		pkgLogger.Child("wh_bc_manager"),
+	a.bcManager = newBackendConfigManager(
+		a.conf, a.wrappedDBHandle, a.tenantManager,
+		a.logger.Child("wh_bc_manager"),
 	)
 	g.Go(func() error {
-		bcManager.Start(ctx)
+		a.bcManager.Start(ctx)
 		return nil
 	})
 
-	RegisterAdmin(bcManager, pkgLogger)
+	RegisterAdmin(a.bcManager, a.logger)
 
 	runningMode := config.GetString("Warehouse.runningMode", "")
 	if runningMode == DegradedMode {
-		pkgLogger.Infof("WH: Running warehouse service in degraded mode...")
-		if isMaster() {
-			err := InitWarehouseAPI(dbHandle, bcManager, pkgLogger.Child("upload_api"))
+		a.logger.Infof("WH: Running warehouse service in degraded mode...")
+		if a.isMaster() {
+			err := InitWarehouseAPI(a.dbHandle, bcManager, a.logger.Child("upload_api"))
 			if err != nil {
-				pkgLogger.Errorf("WH: Failed to start warehouse api: %v", err)
+				a.logger.Errorf("WH: Failed to start warehouse api: %v", err)
 				return err
 			}
 		}
-		return startWebHandler(ctx)
+		return a.startWebHandler(ctx)
 	}
 	var err error
 	workspaceIdentifier := fmt.Sprintf(`%s::%s`, config.GetKubeNamespace(), misc.GetMD5Hash(config.GetWorkspaceToken()))
@@ -823,8 +842,8 @@ func Start(ctx context.Context, app app.App) error {
 
 	// Setting up reporting client
 	// only if standalone or embedded connecting to diff DB for warehouse
-	if (isStandAlone() && isMaster()) || (misc.GetConnectionString() != psqlInfo) {
-		reporting := application.Features().Reporting.Setup(backendconfig.DefaultBackendConfig)
+	if (a.isStandAlone() && a.isMaster()) || (misc.GetConnectionString() != psqlInfo) {
+		reporting := a.application.Features().Reporting.Setup(a.bcConfig)
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
 			reporting.AddClient(ctx, types.Config{ConnInfo: psqlInfo, ClientName: types.WarehouseReportingClient})
@@ -832,19 +851,19 @@ func Start(ctx context.Context, app app.App) error {
 		}))
 	}
 
-	if isStandAlone() && isMaster() {
+	if a.isStandAlone() && a.isMaster() {
 		// Report warehouse features
 		g.Go(func() error {
-			backendconfig.DefaultBackendConfig.WaitForConfig(ctx)
+			a.bcConfig.WaitForConfig(ctx)
 
 			c := controlplane.NewClient(
-				backendconfig.GetConfigBackendURL(),
-				backendconfig.DefaultBackendConfig.Identity(),
+				a.config.configBackendURL,
+				a.bcConfig.Identity(),
 			)
 
 			err := c.SendFeatures(ctx, info.WarehouseComponent.Name, info.WarehouseComponent.Features)
 			if err != nil {
-				pkgLogger.Errorf("error sending warehouse features: %v", err)
+				a.logger.Errorf("error sending warehouse features: %v", err)
 			}
 
 			// We don't want to exit if we fail to send features
@@ -852,62 +871,60 @@ func Start(ctx context.Context, app app.App) error {
 		})
 	}
 
-	if isSlave() {
-		pkgLogger.Infof("WH: Starting warehouse slave...")
+	if a.isSlave() {
+		a.logger.Infof("WH: Starting warehouse slave...")
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
 			return setupSlave(ctx)
 		}))
 	}
 
-	if isMaster() {
-		pkgLogger.Infof("[WH]: Starting warehouse master...")
+	if a.isMaster() {
+		a.logger.Infof("[WH]: Starting warehouse master...")
 
-		backendconfig.DefaultBackendConfig.WaitForConfig(ctx)
+		a.bcConfig.WaitForConfig(ctx)
 
-		region := config.GetString("region", "")
-
-		controlPlaneClient = controlplane.NewClient(
-			backendconfig.GetConfigBackendURL(),
-			backendconfig.DefaultBackendConfig.Identity(),
-			controlplane.WithRegion(region),
+		a.controlPlaneClient = controlplane.NewClient(
+			a.config.configBackendURL,
+			a.bcConfig.Identity(),
+			controlplane.WithRegion(a.config.region),
 		)
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			return notifier.ClearJobs(ctx)
+			return a.notifier.ClearJobs(ctx)
 		}))
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			err := monitorDestRouters(ctx)
+			err := a.monitorDestRouters(ctx)
 			return err
 		}))
 
-		archiver := &archive.Archiver{
-			DB:          dbHandle,
-			Stats:       stats.Default,
-			Logger:      pkgLogger.Child("archiver"),
-			FileManager: filemanager.New,
-			Multitenant: tenantManager,
-		}
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			archive.CronArchiver(ctx, archiver)
+			archive.CronArchiver(ctx, &archive.Archiver{
+				DB:          a.dbHandle,
+				Stats:       a.stats,
+				Logger:      a.logger.Child("archiver"),
+				FileManager: filemanager.New,
+				Multitenant: a.tenantManager,
+			})
 			return nil
 		}))
 
-		err := InitWarehouseAPI(dbHandle, bcManager, pkgLogger.Child("upload_api"))
+		err := InitWarehouseAPI(a.dbHandle, a.bcManager, a.logger.Child("upload_api"))
 		if err != nil {
-			pkgLogger.Errorf("WH: Failed to start warehouse api: %v", err)
+			a.logger.Errorf("WH: Failed to start warehouse api: %v", err)
 			return err
 		}
-		asyncWh = jobs.InitWarehouseJobsAPI(ctx, dbHandle, &notifier)
-		jobs.WithConfig(asyncWh, config.Default)
+
+		a.asyncJob = jobs.InitWarehouseJobsAPI(ctx, a.dbHandle, &a.notifier)
+		jobs.WithConfig(a.asyncJob, a.conf)
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			return asyncWh.InitAsyncJobRunner()
+			return a.asyncJob.InitAsyncJobRunner()
 		}))
 	}
 
 	g.Go(func() error {
-		return startWebHandler(ctx)
+		return a.startWebHandler(ctx)
 	})
 
 	return g.Wait()

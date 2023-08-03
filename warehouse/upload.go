@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,6 +74,7 @@ type UploadJobFactory struct {
 }
 
 type UploadJob struct {
+	stats                stats.Stats
 	ctx                  context.Context
 	dbHandle             *sqlmiddleware.DB
 	destinationValidator validations.DestinationValidator
@@ -82,6 +84,8 @@ type UploadJob struct {
 	whManager            manager.Manager
 	pgNotifier           *pgnotifier.PGNotifier
 	schemaHandle         *Schema
+	conf                 config.Config
+	log                  logger.Logger
 	stats                stats.Stats
 	LoadFileGenStartTime time.Time
 
@@ -94,16 +98,18 @@ type UploadJob struct {
 	alertSender    alerta.AlertSender
 	now            func() time.Time
 
-	pendingTableUploads       []model.PendingTableUpload
-	pendingTableUploadsRepo   pendingTableUploadsRepo
-	pendingTableUploadsOnce   sync.Once
-	pendingTableUploadsError  error
-	refreshPartitionBatchSize int
-	retryTimeWindow           time.Duration
-	minRetryAttempts          int
-	disableAlter              bool
-	minUploadBackoff          time.Duration
-	maxUploadBackoff          time.Duration
+	pendingTableUploads                 []model.PendingTableUpload
+	pendingTableUploadsRepo             pendingTableUploadsRepo
+	pendingTableUploadsOnce             sync.Once
+	pendingTableUploadsError            error
+	refreshPartitionBatchSize           int
+	retryTimeWindow                     time.Duration
+	minRetryAttempts                    int
+	disableAlter                        bool
+	minUploadBackoff                    time.Duration
+	maxUploadBackoff                    time.Duration
+	tableCountQueryTimeout              time.Duration
+	longRunningUploadStatThresholdInMin time.Duration
 
 	errorHandler ErrorHandler
 }
@@ -171,7 +177,9 @@ func setMaxParallelLoads() {
 }
 
 func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJob, whManager manager.Manager) *UploadJob {
-	var minUploadBackoff, maxUploadBackoff, retryTimeWindow time.Duration
+	var minUploadBackoff, maxUploadBackoff, retryTimeWindow, tableCountQueryTimeout time.Duration
+	var longRunningUploadStatThresholdInMin time.Duration
+
 	if config.IsSet("Warehouse.minUploadBackoff") {
 		minUploadBackoff = config.GetDuration("Warehouse.minUploadBackoff", 60, time.Second)
 	} else {
@@ -187,6 +195,16 @@ func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJo
 	} else {
 		retryTimeWindow = config.GetDuration("Warehouse.retryTimeWindowInMins", 180, time.Minute)
 	}
+	if config.IsSet("Warehouse.retryTimeWindow") {
+		tableCountQueryTimeout = config.GetDuration("Warehouse.tableCountQueryTimeout", 30, time.Second)
+	} else {
+		tableCountQueryTimeout = config.GetDuration("Warehouse.tableCountQueryTimeoutInS", 30, time.Second)
+	}
+	if config.IsSet("Warehouse.longRunningUploadStatThreshold") {
+		longRunningUploadStatThresholdInMin = config.GetDuration("Warehouse.longRunningUploadStatThreshold", 120, time.Minute)
+	} else {
+		longRunningUploadStatThresholdInMin = config.GetDuration("Warehouse.longRunningUploadStatThresholdInMin", 120, time.Minute)
+	}
 
 	return &UploadJob{
 		ctx:                  ctx,
@@ -197,9 +215,9 @@ func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJo
 		whManager:            whManager,
 		destinationValidator: f.destinationValidator,
 		stats:                f.stats,
-		tableUploadsRepo:     repo.NewTableUploads(wrappedDBHandle),
+		tableUploadsRepo:     repo.NewTableUploads(f.dbHandle),
 		schemaHandle: NewSchema(
-			wrappedDBHandle,
+			f.dbHandle,
 			dto.Warehouse,
 			config.Default,
 		),
@@ -209,15 +227,17 @@ func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJo
 		stagingFiles:   dto.StagingFiles,
 		stagingFileIDs: repo.StagingFileIDs(dto.StagingFiles),
 
-		pendingTableUploadsRepo: repo.NewUploads(wrappedDBHandle),
+		pendingTableUploadsRepo: repo.NewUploads(f.dbHandle),
 		pendingTableUploads:     []model.PendingTableUpload{},
 
-		refreshPartitionBatchSize: config.GetInt("Warehouse.refreshPartitionBatchSize", 100),
-		retryTimeWindow:           retryTimeWindow,
-		minRetryAttempts:          config.GetInt("Warehouse.minRetryAttempts", 3),
-		disableAlter:              config.GetBool("Warehouse.disableAlter", false),
-		minUploadBackoff:          minUploadBackoff,
-		maxUploadBackoff:          maxUploadBackoff,
+		refreshPartitionBatchSize:           config.GetInt("Warehouse.refreshPartitionBatchSize", 100),
+		retryTimeWindow:                     retryTimeWindow,
+		minRetryAttempts:                    config.GetInt("Warehouse.minRetryAttempts", 3),
+		disableAlter:                        config.GetBool("Warehouse.disableAlter", false),
+		minUploadBackoff:                    minUploadBackoff,
+		maxUploadBackoff:                    maxUploadBackoff,
+		tableCountQueryTimeout:              tableCountQueryTimeout,
+		longRunningUploadStatThresholdInMin: longRunningUploadStatThresholdInMin,
 
 		alertSender: alerta.NewClient(
 			config.GetString("ALERTA_URL", "https://alerta.rudderstack.com/api/"),
@@ -250,7 +270,7 @@ func (job *UploadJob) trackLongRunningUpload() chan struct{} {
 		select {
 		case <-ch:
 			// do nothing
-		case <-time.After(longRunningUploadStatThresholdInMin):
+		case <-time.After(job.longRunningUploadStatThresholdInMin):
 			pkgLogger.Infof("[WH]: Registering stat for long running upload: %d, dest: %s", job.upload.ID, job.warehouse.Identifier)
 
 			job.stats.NewTaggedStat(
@@ -359,14 +379,14 @@ func (job *UploadJob) getTotalRowsInLoadFiles(ctx context.Context) int64 {
 		misc.IntArrayToString(job.stagingFileIDs, ","),
 		warehouseutils.ToProviderCase(job.warehouse.Type, warehouseutils.DiscardsTable),
 	)
-	if err := wrappedDBHandle.QueryRowContext(ctx, sqlStatement).Scan(&total); err != nil {
+	if err := job.dbHandle.QueryRowContext(ctx, sqlStatement).Scan(&total); err != nil {
 		pkgLogger.Errorf(`Error in getTotalRowsInLoadFiles: %v`, err)
 	}
 	return total.Int64
 }
 
 func (job *UploadJob) matchRowsInStagingAndLoadFiles(ctx context.Context) error {
-	rowsInStagingFiles, err := repo.NewStagingFiles(wrappedDBHandle).TotalEventsForUpload(ctx, job.upload)
+	rowsInStagingFiles, err := repo.NewStagingFiles(job.dbHandle).TotalEventsForUpload(ctx, job.upload)
 	if err != nil {
 		return fmt.Errorf("total rows: %w", err)
 	}
@@ -632,7 +652,7 @@ func (job *UploadJob) run() (err error) {
 		uploadStatusOpts := UploadStatusOpts{Status: newStatus}
 		if newStatus == model.ExportedData {
 
-			rowCount, _ := repo.NewStagingFiles(wrappedDBHandle).TotalEventsForUpload(job.ctx, job.upload)
+			rowCount, _ := repo.NewStagingFiles(job.dbHandle).TotalEventsForUpload(job.ctx, job.upload)
 
 			reportingMetric := types.PUReportedMetric{
 				ConnectionDetails: types.ConnectionDetails{
@@ -767,7 +787,7 @@ func (job *UploadJob) TablesToSkip() (map[string]model.PendingTableUpload, map[s
 func (job *UploadJob) resolveIdentities(populateHistoricIdentities bool) (err error) {
 	idr := identity.New(
 		job.warehouse,
-		wrappedDBHandle,
+		job.dbHandle,
 		job,
 		job.upload.ID,
 		job.whManager,
@@ -1016,7 +1036,7 @@ func (job *UploadJob) getTotalCount(tName string) (int64, error) {
 	)
 
 	operation := func() error {
-		ctx, cancel := context.WithTimeout(job.ctx, tableCountQueryTimeout)
+		ctx, cancel := context.WithTimeout(job.ctx, job.tableCountQueryTimeout)
 		defer cancel()
 
 		total, countErr = job.whManager.GetTotalCountInTable(ctx, tName)
@@ -1447,7 +1467,7 @@ func (job *UploadJob) setUploadStatus(statusOpts UploadStatusOpts) (err error) {
 	uploadColumnOpts := UploadColumnsOpts{Fields: additionalFields}
 
 	if statusOpts.ReportingMetric != (types.PUReportedMetric{}) {
-		txn, err := wrappedDBHandle.BeginTx(job.ctx, &sql.TxOptions{})
+		txn, err := job.dbHandle.BeginTx(job.ctx, &sql.TxOptions{})
 		if err != nil {
 			return err
 		}
@@ -1530,7 +1550,7 @@ func (job *UploadJob) setUploadColumns(opts UploadColumnsOpts) error {
 	if opts.Txn != nil {
 		querier = opts.Txn
 	} else {
-		querier = wrappedDBHandle
+		querier = job.dbHandle
 	}
 	_, err := querier.ExecContext(job.ctx, sqlStatement, values...)
 	return err
@@ -1693,7 +1713,7 @@ func (job *UploadJob) setUploadError(statusError error, state string) (string, e
 	if err = job.setUploadColumns(UploadColumnsOpts{Fields: uploadColumns, Txn: txn}); err != nil {
 		return "", fmt.Errorf("unable to change upload columns: %w", err)
 	}
-	inputCount, _ := repo.NewStagingFiles(wrappedDBHandle).TotalEventsForUpload(job.ctx, upload)
+	inputCount, _ := repo.NewStagingFiles(job.dbHandle).TotalEventsForUpload(job.ctx, upload)
 	outputCount, _ := job.tableUploadsRepo.TotalExportedEvents(job.ctx, job.upload.ID, []string{
 		warehouseutils.ToProviderCase(job.warehouse.Type, warehouseutils.DiscardsTable),
 	})
@@ -1826,7 +1846,7 @@ func (job *UploadJob) getLoadFilesTableMap() (loadFilesMap map[tableNameT]bool, 
 		job.upload.LoadFileStartID,
 		job.upload.LoadFileEndID,
 	}
-	rows, err := wrappedDBHandle.QueryContext(job.ctx, sqlStatement, sqlStatementArgs...)
+	rows, err := job.dbHandle.QueryContext(job.ctx, sqlStatement, sqlStatementArgs...)
 	if err == sql.ErrNoRows {
 		err = nil
 		return
@@ -1918,7 +1938,7 @@ func (job *UploadJob) GetLoadFilesMetadata(ctx context.Context, options warehous
 	)
 
 	pkgLogger.Debugf(`Fetching loadFileLocations: %v`, sqlStatement)
-	rows, err := wrappedDBHandle.QueryContext(ctx, sqlStatement)
+	rows, err := job.dbHandle.QueryContext(ctx, sqlStatement)
 	if err != nil {
 		panic(fmt.Errorf("query: %s\nfailed with Error : %w", sqlStatement, err))
 	}

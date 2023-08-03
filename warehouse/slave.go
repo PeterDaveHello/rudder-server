@@ -850,3 +850,20 @@ func runAsyncJob(ctx context.Context, asyncjob jobs.AsyncJobPayload) (asyncJobRu
 	}
 	return asyncJobRunResult, err
 }
+
+func getDestinationFromSlaveConnectionMap(destinationId, sourceId string) (model.Warehouse, error) {
+	if destinationId == "" || sourceId == "" {
+		return model.Warehouse{}, errors.New("invalid Parameters")
+	}
+	sourceMap, ok := bcManager.ConnectionSourcesMap(destinationId)
+	if !ok {
+		return model.Warehouse{}, errors.New("invalid Destination Id")
+	}
+
+	conn, ok := sourceMap[sourceId]
+	if !ok {
+		return model.Warehouse{}, errors.New("invalid Source Id")
+	}
+
+	return conn, nil
+}

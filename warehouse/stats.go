@@ -75,7 +75,7 @@ func (job *UploadJob) generateUploadSuccessMetrics() {
 		return
 	}
 
-	numStagedEvents, err = repo.NewStagingFiles(wrappedDBHandle).TotalEventsForUpload(
+	numStagedEvents, err = repo.NewStagingFiles(job.dbHandle).TotalEventsForUpload(
 		job.ctx,
 		job.upload,
 	)
@@ -119,7 +119,7 @@ func (job *UploadJob) generateUploadAbortedMetrics() {
 		return
 	}
 
-	numStagedEvents, err = repo.NewStagingFiles(wrappedDBHandle).TotalEventsForUpload(
+	numStagedEvents, err = repo.NewStagingFiles(job.dbHandle).TotalEventsForUpload(
 		job.ctx,
 		job.upload,
 	)
@@ -163,7 +163,7 @@ func (job *UploadJob) recordTableLoad(tableName string, numEvents int64) {
 		Value: strings.ToLower(tableName),
 	}).Count(int(numEvents))
 	// Delay for the oldest event in the batch
-	firstEventAt, err := repo.NewStagingFiles(wrappedDBHandle).FirstEventForUpload(job.ctx, job.upload)
+	firstEventAt, err := repo.NewStagingFiles(job.dbHandle).FirstEventForUpload(job.ctx, job.upload)
 	if err != nil {
 		pkgLogger.Errorf("[WH]: Failed to generate delay metrics: %s, Err: %v", job.warehouse.Identifier, err)
 		return
