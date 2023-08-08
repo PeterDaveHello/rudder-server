@@ -90,7 +90,7 @@ func (ic *IndexConstraint) violates(brEvent *BatchRouterEvent, columnName string
 	}
 	concatenatedLength := 0
 	for _, column := range ic.IndexColumns {
-		columnInfo, ok := brEvent.GetColumnInfo(column)
+		columnInfo, ok := brEvent.columnInfo(column)
 		if !ok {
 			continue
 		}

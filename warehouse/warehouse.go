@@ -212,7 +212,7 @@ func getBucketFolder(batchID, tableName string) string {
 
 // Gets the config from config backend and extracts enabled write keys
 func (a *App) monitorDestRouters(ctx context.Context) error {
-	dstToWhRouter := make(map[string]*Router)
+	dstToWhRouter := make(map[string]*router)
 
 	ch := a.tenantManager.WatchConfig(ctx)
 	for configData := range ch {
@@ -223,14 +223,14 @@ func (a *App) monitorDestRouters(ctx context.Context) error {
 	}
 
 	g, _ := errgroup.WithContext(context.Background())
-	for _, wh := range dstToWhRouter {
-		wh := wh
-		g.Go(wh.Shutdown)
+	for _, router := range dstToWhRouter {
+		router := router
+		g.Go(router.Shutdown)
 	}
 	return g.Wait()
 }
 
-func (a *App) onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.ConfigT, dstToWhRouter map[string]*Router) error {
+func (a *App) onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.ConfigT, dstToWhRouter map[string]*router) error {
 	enabledDestinations := make(map[string]bool)
 	for _, wConfig := range configMap {
 		for _, source := range wConfig.Sources {
@@ -240,7 +240,7 @@ func (a *App) onConfigDataEvent(ctx context.Context, configMap map[string]backen
 					router, ok := dstToWhRouter[destination.DestinationDefinition.Name]
 					if !ok {
 						a.logger.Info("Starting a new Warehouse Destination Router: ", destination.DestinationDefinition.Name)
-						router, err := NewRouter(
+						router, err := newRouter(
 							ctx,
 							destination.DestinationDefinition.Name,
 							a.conf,
@@ -800,13 +800,13 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 		}
 	}()
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, gCtx := errgroup.WithContext(ctx)
 
 	a.tenantManager = &multitenant.Manager{
 		BackendConfig: a.bcConfig,
 	}
 	g.Go(func() error {
-		a.tenantManager.Run(ctx)
+		a.tenantManager.Run(gCtx)
 		return nil
 	})
 
@@ -815,7 +815,7 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 		a.logger.Child("wh_bc_manager"),
 	)
 	g.Go(func() error {
-		a.bcManager.Start(ctx)
+		a.bcManager.Start(gCtx)
 		return nil
 	})
 
@@ -846,7 +846,7 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 		reporting := a.application.Features().Reporting.Setup(a.bcConfig)
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			reporting.AddClient(ctx, types.Config{ConnInfo: psqlInfo, ClientName: types.WarehouseReportingClient})
+			reporting.AddClient(gCtx, types.Config{ConnInfo: psqlInfo, ClientName: types.WarehouseReportingClient})
 			return nil
 		}))
 	}
@@ -854,14 +854,14 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 	if a.isStandAlone() && a.isMaster() {
 		// Report warehouse features
 		g.Go(func() error {
-			a.bcConfig.WaitForConfig(ctx)
+			a.bcConfig.WaitForConfig(gCtx)
 
 			c := controlplane.NewClient(
 				a.config.configBackendURL,
 				a.bcConfig.Identity(),
 			)
 
-			err := c.SendFeatures(ctx, info.WarehouseComponent.Name, info.WarehouseComponent.Features)
+			err := c.SendFeatures(gCtx, info.WarehouseComponent.Name, info.WarehouseComponent.Features)
 			if err != nil {
 				a.logger.Errorf("error sending warehouse features: %v", err)
 			}
@@ -874,7 +874,7 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 	if a.isSlave() {
 		a.logger.Infof("WH: Starting warehouse slave...")
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			return setupSlave(ctx)
+			return setupSlave(gCtx)
 		}))
 	}
 
@@ -890,16 +890,15 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 		)
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			return a.notifier.ClearJobs(ctx)
+			return a.notifier.ClearJobs(gCtx)
 		}))
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			err := a.monitorDestRouters(ctx)
-			return err
+			return a.monitorDestRouters(ctx)
 		}))
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			archive.CronArchiver(ctx, &archive.Archiver{
+			archive.CronArchiver(gCtx, &archive.Archiver{
 				DB:          a.dbHandle,
 				Stats:       a.stats,
 				Logger:      a.logger.Child("archiver"),
@@ -915,7 +914,7 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 			return err
 		}
 
-		a.asyncJob = jobs.InitWarehouseJobsAPI(ctx, a.dbHandle, &a.notifier)
+		a.asyncJob = jobs.InitWarehouseJobsAPI(gCtx, a.dbHandle, &a.notifier)
 		jobs.WithConfig(a.asyncJob, a.conf)
 
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
@@ -924,7 +923,7 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 	}
 
 	g.Go(func() error {
-		return a.startWebHandler(ctx)
+		return a.startWebHandler(gCtx)
 	})
 
 	return g.Wait()

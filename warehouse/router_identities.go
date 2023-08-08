@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/rudderlabs/rudder-server/warehouse/logfield"
-
 	"github.com/rudderlabs/rudder-server/warehouse/integrations/manager"
+
+	"github.com/rudderlabs/rudder-go-kit/stats"
+
+	"github.com/rudderlabs/rudder-server/warehouse/logfield"
 
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 
-	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/rruntime"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/rudderlabs/rudder-server/utils/timeutil"
@@ -72,7 +73,7 @@ func isDestHistoricIdentitiesPopulateInProgress(warehouse model.Warehouse) bool 
 	return false
 }
 
-func (r *Router) getPendingPopulateIdentitiesLoad(warehouse model.Warehouse) (upload model.Upload, found bool) {
+func (r *router) getPendingPopulateIdentitiesLoad(warehouse model.Warehouse) (upload model.Upload, found bool) {
 	sqlStatement := fmt.Sprintf(`
 		SELECT
 			id,
@@ -133,11 +134,11 @@ func (r *Router) getPendingPopulateIdentitiesLoad(warehouse model.Warehouse) (up
 	return
 }
 
-func (r *Router) populateHistoricIdentitiesDestType() string {
+func (r *router) populateHistoricIdentitiesDestType() string {
 	return r.destType + "_IDENTITY_PRE_LOAD"
 }
 
-func (r *Router) hasLocalIdentityData(warehouse model.Warehouse) (exists bool) {
+func (r *router) hasLocalIdentityData(warehouse model.Warehouse) (exists bool) {
 	sqlStatement := fmt.Sprintf(`
 		SELECT
 		  EXISTS (
@@ -157,8 +158,8 @@ func (r *Router) hasLocalIdentityData(warehouse model.Warehouse) (exists bool) {
 	return
 }
 
-func (r *Router) hasWarehouseData(ctx context.Context, warehouse model.Warehouse) (bool, error) {
-	whManager, err := manager.New(r.destType, r.conf, r.logger, r.stats)
+func (r *router) hasWarehouseData(ctx context.Context, warehouse model.Warehouse) (bool, error) {
+	whManager, err := manager.New(r.destType, r.conf, r.logger, r.statsFactory)
 	if err != nil {
 		panic(err)
 	}
@@ -170,7 +171,7 @@ func (r *Router) hasWarehouseData(ctx context.Context, warehouse model.Warehouse
 	return !empty, nil
 }
 
-func (r *Router) setupIdentityTables(ctx context.Context, warehouse model.Warehouse) {
+func (r *router) setupIdentityTables(ctx context.Context, warehouse model.Warehouse) {
 	var name sql.NullString
 	sqlStatement := fmt.Sprintf(`SELECT to_regclass('%s')`, warehouseutils.IdentityMappingsTableName(warehouse))
 	err := r.dbHandle.QueryRow(sqlStatement).Scan(&name)
@@ -271,7 +272,7 @@ func (r *Router) setupIdentityTables(ctx context.Context, warehouse model.Wareho
 	}
 }
 
-func (r *Router) initPrePopulateDestIdentitiesUpload(warehouse model.Warehouse) model.Upload {
+func (r *router) initPrePopulateDestIdentitiesUpload(warehouse model.Warehouse) model.Upload {
 	schema := make(model.Schema)
 	// TODO: DRY this code
 	identityRules := model.TableSchema{
@@ -346,13 +347,14 @@ func (r *Router) initPrePopulateDestIdentitiesUpload(warehouse model.Warehouse) 
 	return upload
 }
 
-func (*Router) setFailedStat(warehouse model.Warehouse, err error) {
-	if err != nil {
-		warehouseutils.DestStat(stats.CountType, "failed_uploads", warehouse.Identifier).Count(1)
+func (*router) setFailedStat(warehouse model.Warehouse, err error) {
+	if err == nil {
+		return
 	}
+	warehouseutils.DestStat(stats.CountType, "failed_uploads", warehouse.Identifier).Count(1)
 }
 
-func (r *Router) populateHistoricIdentities(ctx context.Context, warehouse model.Warehouse) {
+func (r *router) populateHistoricIdentities(ctx context.Context, warehouse model.Warehouse) {
 	if isDestHistoricIdentitiesPopulated(warehouse) || isDestHistoricIdentitiesPopulateInProgress(warehouse) {
 		return
 	}
@@ -396,7 +398,7 @@ func (r *Router) populateHistoricIdentities(ctx context.Context, warehouse model
 			upload = r.initPrePopulateDestIdentitiesUpload(warehouse)
 		}
 
-		whManager, err := manager.New(r.destType, r.conf, r.logger, r.stats)
+		whManager, err := manager.New(r.destType, r.conf, r.logger, r.statsFactory)
 		if err != nil {
 			panic(err)
 		}
@@ -404,7 +406,9 @@ func (r *Router) populateHistoricIdentities(ctx context.Context, warehouse model
 		job := r.uploadJobFactory.NewUploadJob(ctx, &model.UploadJob{
 			Upload:    upload,
 			Warehouse: warehouse,
-		}, whManager)
+		},
+			whManager,
+		)
 
 		tableUploadsCreated, tableUploadsErr := job.tableUploadsRepo.ExistsForUploadID(ctx, job.upload.ID)
 		if tableUploadsErr != nil {

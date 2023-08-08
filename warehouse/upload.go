@@ -74,7 +74,6 @@ type UploadJobFactory struct {
 }
 
 type UploadJob struct {
-	stats                stats.Stats
 	ctx                  context.Context
 	dbHandle             *sqlmiddleware.DB
 	destinationValidator validations.DestinationValidator

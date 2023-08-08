@@ -1,6 +1,7 @@
 package warehouse
 
 import (
+	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 	"sync"
 	"time"
 
@@ -47,6 +48,20 @@ type LoadFileJob struct {
 type BatchRouterEvent struct {
 	Metadata Metadata `json:"metadata"`
 	Data     Data     `json:"data"`
+}
+
+func (event *BatchRouterEvent) columnInfo(columnName string) (columnInfo warehouseutils.ColumnInfo, ok bool) {
+	columnVal, ok := event.Data[columnName]
+	if !ok {
+		return warehouseutils.ColumnInfo{}, false
+	}
+
+	columnType, ok := event.Metadata.Columns[columnName]
+	if !ok {
+		return warehouseutils.ColumnInfo{}, false
+	}
+
+	return warehouseutils.ColumnInfo{Value: columnVal, Type: columnType}, true
 }
 
 type Metadata struct {

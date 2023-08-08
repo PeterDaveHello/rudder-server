@@ -151,15 +151,15 @@ func TestRouter_Track(t *testing.T) {
 				nowSQL = tc.NowSQL
 			}
 
-			handle := Router{
+			handle := router{
 				destType: destType,
 				now: func() time.Time {
 					return now
 				},
-				nowSQL:   nowSQL,
-				stats:    store,
-				dbHandle: sqlquerywrapper.New(pgResource.DB),
-				logger:   logger.NOP,
+				nowSQL:       nowSQL,
+				statsFactory: store,
+				dbHandle:     sqlquerywrapper.New(pgResource.DB),
+				logger:       logger.NOP,
 			}
 
 			err = handle.Track(ctx, &warehouse, conf)
@@ -208,13 +208,13 @@ func TestRouter_CronTracker(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
 		mockLogger := mock_logger.NewMockLogger(mockCtrl)
 
-		wh := Router{
+		r := router{
 			logger: mockLogger,
 		}
 
 		mockLogger.EXPECT().Infof("context is cancelled, stopped running tracking").Times(1)
 
-		err := wh.CronTracker(ctx)
+		err := r.CronTracker(ctx)
 		require.NoError(t, err)
 	})
 
@@ -261,19 +261,19 @@ func TestRouter_CronTracker(t *testing.T) {
 		now, err := time.Parse(misc.RFC3339Milli, "2022-12-06T06:19:00.169Z")
 		require.NoError(t, err)
 
-		wh := Router{
+		r := router{
 			destType: destType,
 			now: func() time.Time {
 				return now
 			},
-			nowSQL:   "ABC",
-			stats:    memstats.New(),
-			dbHandle: sqlquerywrapper.New(pgResource.DB),
-			logger:   logger.NOP,
+			nowSQL:       "ABC",
+			statsFactory: memstats.New(),
+			dbHandle:     sqlquerywrapper.New(pgResource.DB),
+			logger:       logger.NOP,
 		}
-		wh.warehouses = append(wh.warehouses, warehouse)
+		r.warehouses = append(r.warehouses, warehouse)
 
-		err = wh.CronTracker(context.Background())
+		err = r.CronTracker(context.Background())
 		require.EqualError(t, err, errors.New("cron tracker failed for source: test-sourceID, destination: test-destinationID with error: fetching last upload time for source: test-sourceID and destination: test-destinationID: pq: column \"abc\" does not exist").Error())
 	})
 }
