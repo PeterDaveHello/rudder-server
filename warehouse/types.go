@@ -5,35 +5,11 @@ import (
 	"sync"
 	"time"
 
+	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
+
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 )
-
-type Payload struct {
-	BatchID                      string
-	UploadID                     int64
-	StagingFileID                int64
-	StagingFileLocation          string
-	UploadSchema                 model.Schema
-	WorkspaceID                  string
-	SourceID                     string
-	SourceName                   string
-	DestinationID                string
-	DestinationName              string
-	DestinationType              string
-	DestinationNamespace         string
-	DestinationRevisionID        string
-	StagingDestinationRevisionID string
-	DestinationConfig            map[string]interface{}
-	StagingDestinationConfig     interface{}
-	UseRudderStorage             bool
-	StagingUseRudderStorage      bool
-	UniqueLoadGenID              string
-	RudderStoragePrefix          string
-	Output                       []uploadResult
-	LoadFilePrefix               string // prefix for the load file name
-	LoadFileType                 string
-}
 
 type LoadFileJob struct {
 	StagingFile                *model.StagingFile

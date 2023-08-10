@@ -143,18 +143,16 @@ func NewApp(
 }
 
 var (
-	application                         app.App
-	wrappedDBHandle                     *sqlquerywrapper.DB
-	notifier                            pgnotifier.PGNotifier
-	tenantManager                       *multitenant.Manager
-	noOfSlaveWorkerRoutines             int
-	uploadFreqInS                       int64
-	lastProcessedMarkerMap              map[string]int64
-	lastProcessedMarkerExp              = expvar.NewMap("lastProcessedMarkerMap")
-	lastProcessedMarkerMapLock          sync.RWMutex
-	maxStagingFileReadBufferCapacityInK int
-	bcManager                           *backendConfigManager
-	pkgLogger                           logger.Logger
+	application                app.App
+	wrappedDBHandle            *sqlquerywrapper.DB
+	notifier                   pgnotifier.PGNotifier
+	tenantManager              *multitenant.Manager
+	uploadFreqInS              int64
+	lastProcessedMarkerMap     map[string]int64
+	lastProcessedMarkerExp     = expvar.NewMap("lastProcessedMarkerMap")
+	lastProcessedMarkerMapLock sync.RWMutex
+	bcManager                  *backendConfigManager
+	pkgLogger                  logger.Logger
 )
 
 const (
@@ -174,11 +172,8 @@ func Init4() {
 
 func loadConfig() {
 	// Port where WH is running
-	config.RegisterIntConfigVariable(4, &noOfSlaveWorkerRoutines, true, 1, "Warehouse.noOfSlaveWorkerRoutines")
 	config.RegisterInt64ConfigVariable(1800, &uploadFreqInS, true, 1, "Warehouse.uploadFreqInS")
 	lastProcessedMarkerMap = map[string]int64{}
-
-	config.RegisterIntConfigVariable(10240, &maxStagingFileReadBufferCapacityInK, true, 1, "Warehouse.maxStagingFileReadBufferCapacityInK")
 }
 
 func getUploadFreqInS(syncFrequency string) int64 {
@@ -874,7 +869,9 @@ func (a *App) Start(ctx context.Context, app app.App) error {
 	if a.isSlave() {
 		a.logger.Infof("WH: Starting warehouse slave...")
 		g.Go(misc.WithBugsnagForWarehouse(func() error {
-			return setupSlave(gCtx)
+			cm := newConstraintsManager(config.Default)
+			slave := newSlave(config.Default, pkgLogger, stats.Default, &notifier, bcManager, cm)
+			return slave.setupSlave(gCtx)
 		}))
 	}
 
