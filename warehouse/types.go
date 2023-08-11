@@ -1,7 +1,6 @@
 package warehouse
 
 import (
-	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 	"sync"
 	"time"
 
@@ -26,7 +25,7 @@ type BatchRouterEvent struct {
 	Data     Data     `json:"data"`
 }
 
-func (event *BatchRouterEvent) columnInfo(columnName string) (columnInfo warehouseutils.ColumnInfo, ok bool) {
+func (event *BatchRouterEvent) GetColumnInfo(columnName string) (columnInfo warehouseutils.ColumnInfo, ok bool) {
 	columnVal, ok := event.Data[columnName]
 	if !ok {
 		return warehouseutils.ColumnInfo{}, false

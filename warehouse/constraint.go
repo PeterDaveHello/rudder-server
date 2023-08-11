@@ -1,7 +1,7 @@
 package warehouse
 
 import (
-	"fmt"
+	"github.com/rudderlabs/rudder-go-kit/config"
 
 	"github.com/rudderlabs/rudder-go-kit/config"
 
@@ -98,8 +98,9 @@ func (ic *indexConstraint) violates(brEvent *BatchRouterEvent, columnName string
 	}
 
 	concatenatedLength := 0
+
 	for _, column := range ic.indexColumns {
-		columnInfo, ok := brEvent.columnInfo(column)
+		columnInfo, ok := brEvent.GetColumnInfo(column)
 		if !ok {
 			continue
 		}
@@ -115,6 +116,6 @@ func (ic *indexConstraint) violates(brEvent *BatchRouterEvent, columnName string
 	}
 	return &constraintsViolation{
 		isViolated:         concatenatedLength > ic.limit,
-		violatedIdentifier: fmt.Sprintf(`%s-%s`, strcase.ToKebab(warehouseutils.DiscardsTable), misc.FastUUID().String()),
+		violatedIdentifier: strcase.ToKebab(warehouseutils.DiscardsTable) + "-" + misc.FastUUID().String(),
 	}
 }
