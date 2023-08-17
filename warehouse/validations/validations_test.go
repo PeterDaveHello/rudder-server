@@ -22,7 +22,6 @@ func TestValidate(t *testing.T) {
 	misc.Init()
 	warehouseutils.Init()
 	encoding.Init()
-	validations.Init()
 
 	var (
 		provider  = "MINIO"

@@ -157,8 +157,8 @@ func InitWarehouseAPI(dbHandle *sql.DB, bcManager *backendConfigManager, log log
 			Logger:        log,
 			RegisterService: func(srv *grpc.Server) {
 				proto.RegisterWarehouseServer(srv, &warehouseGRPC{
-					EnableTunnelling: config.GetBool("ENABLE_TUNNELLING", true),
-					CPClient:         client,
+					enableTunnelling: config.GetBool("ENABLE_TUNNELLING", true),
+					cpClient:         client,
 				})
 			},
 		},
@@ -828,7 +828,7 @@ func checkMapForValidKey(configMap map[string]interface{}, key string) bool {
 	return false
 }
 
-func validateObjectStorage(ctx context.Context, request *ObjectStorageValidationRequest) error {
+func validateObjectStorage(ctx context.Context, validationManager validations.Manager, request *ObjectStorageValidationRequest) error {
 	pkgLogger.Infof("Received call to validate object storage for type: %s\n", request.Type)
 
 	settings, err := getFileManagerSettings(ctx, request.Type, request.Config)
@@ -845,7 +845,7 @@ func validateObjectStorage(ctx context.Context, request *ObjectStorageValidation
 		DestinationDefinition: backendconfig.DestinationDefinitionT{Name: request.Type},
 	}
 
-	filePath, err := validations.CreateTempLoadFile(&req)
+	filePath, err := validationManager.CreateTempLoadFile(&req)
 	if err != nil {
 		return fmt.Errorf("unable to create temp load file: \n%w", err)
 	}

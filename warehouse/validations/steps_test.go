@@ -1,6 +1,9 @@
-package validations_test
+package validations
 
 import (
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"testing"
 
 	"github.com/rudderlabs/rudder-server/warehouse/encoding"
@@ -10,8 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
-	"github.com/rudderlabs/rudder-server/warehouse/validations"
-
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
 
@@ -94,7 +95,9 @@ func TestValidationSteps(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			steps := validations.StepsToValidate(&tc.dest)
+			vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+			steps := vm.stepsToValidate(&tc.dest)
 			require.Len(t, steps.Steps, len(tc.steps))
 
 			for i, step := range steps.Steps {

@@ -4,9 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
-
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	"time"
 
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 
@@ -22,13 +21,12 @@ const (
 )
 
 var (
-	connectionTestingFolder        string
-	pkgLogger                      logger.Logger
-	fileManagerFactory             filemanager.Factory
-	objectStorageValidationTimeout time.Duration
+	tableSchemaMap model.TableSchema
+	alterColumnMap model.TableSchema
+	payloadMap     map[string]interface{}
 )
 
-var (
+func init() {
 	tableSchemaMap = model.TableSchema{
 		"id":  "int",
 		"val": "string",
@@ -40,44 +38,44 @@ var (
 	alterColumnMap = model.TableSchema{
 		"val_alter": "string",
 	}
-)
-
-type validationFunc struct {
-	Func func(context.Context, *backendconfig.DestinationT, string) (json.RawMessage, error)
 }
 
-func Init() {
-	connectionTestingFolder = config.GetString("RUDDER_CONNECTION_TESTING_BUCKET_FOLDER_NAME", misc.RudderTestPayload)
-	pkgLogger = logger.NewLogger().Child("warehouse").Child("validations")
-	fileManagerFactory = filemanager.New
-	objectStorageValidationTimeout = 15 * time.Second
+type Manager struct {
+	conf               *config.Config
+	logger             logger.Logger
+	fileManagerFactory filemanager.Factory
+
+	config struct {
+		objectStorageValidationTimeout time.Duration
+		connectionTestingFolder        string
+	}
+}
+
+func NewManager(conf *config.Config, logger logger.Logger, fileManagerFactory filemanager.Factory) *Manager {
+	m := &Manager{
+		conf:               conf,
+		logger:             logger,
+		fileManagerFactory: fileManagerFactory,
+	}
+
+	m.config.objectStorageValidationTimeout = conf.GetDuration("Warehouse.Validations.ObjectStorageTimeoutInSec", 15, time.Second)
+	m.config.connectionTestingFolder = conf.GetString("RUDDER_CONNECTION_TESTING_BUCKET_FOLDER_NAME", misc.RudderTestPayload)
+
+	return m
 }
 
 // Validate the destination by running all the validation steps
-func Validate(ctx context.Context, req *model.ValidationRequest) (*model.ValidationResponse, error) {
-	res := &model.ValidationResponse{}
-
-	f, ok := validationFunctions()[req.Path]
-	if !ok {
-		return res, fmt.Errorf("invalid path: %s", req.Path)
+func (m *Manager) Validate(ctx context.Context, req *model.ValidationRequest) (json.RawMessage, error) {
+	switch req.Path {
+	case "validate":
+		return json.Marshal(m.validateDestination(ctx, req.Destination, req.Step))
+	case "steps":
+		return json.Marshal(m.stepsToValidate(req.Destination))
+	default:
+		return nil, fmt.Errorf("invalid path: %s", req.Path)
 	}
-
-	result, requestError := f.Func(ctx, req.Destination, req.Step)
-	res.Data = string(result)
-
-	if requestError != nil {
-		res.Error = requestError.Error()
-	}
-	return res, nil
 }
 
-func validationFunctions() map[string]*validationFunc {
-	return map[string]*validationFunc{
-		"validate": {
-			Func: validateDestinationFunc,
-		},
-		"steps": {
-			Func: validateStepFunc,
-		},
-	}
+func (m *Manager) ValidateAllSteps(ctx context.Context, dest *backendconfig.DestinationT) *model.DestinationValidationResponse {
+	return m.validateDestination(ctx, dest, "")
 }

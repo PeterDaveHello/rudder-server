@@ -2,7 +2,6 @@ package validations
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,48 +23,9 @@ import (
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
 
-type Validator interface {
-	Validate(ctx context.Context) error
-}
-
-type objectStorage struct {
-	destination *backendconfig.DestinationT
-}
-
-type connections struct {
-	manager     manager.WarehouseOperations
-	destination *backendconfig.DestinationT
-}
-
-type createSchema struct {
-	manager manager.WarehouseOperations
-}
-
-type createAlterTable struct {
-	manager manager.WarehouseOperations
-	table   string
-}
-
-type fetchSchema struct {
-	manager     manager.WarehouseOperations
-	destination *backendconfig.DestinationT
-}
-
-type loadTable struct {
-	manager     manager.WarehouseOperations
-	destination *backendconfig.DestinationT
-	table       string
-}
-
 type dummyUploader struct {
 	dest *backendconfig.DestinationT
 }
-
-type DestinationValidator interface {
-	Validate(ctx context.Context, dest *backendconfig.DestinationT) *model.DestinationValidationResponse
-}
-
-type destinationValidationImpl struct{}
 
 func (*dummyUploader) GetSchemaInWarehouse() model.Schema { return model.Schema{} }
 func (*dummyUploader) GetLocalSchema(context.Context) (model.Schema, error) {
@@ -103,28 +63,15 @@ func (m *dummyUploader) UseRudderStorage() bool {
 	return misc.IsConfiguredToUseRudderObjectStorage(m.dest.Config)
 }
 
-func NewDestinationValidator() DestinationValidator {
-	return &destinationValidationImpl{}
-}
-
-func (*destinationValidationImpl) Validate(ctx context.Context, dest *backendconfig.DestinationT) *model.DestinationValidationResponse {
-	return validateDestination(ctx, dest, "")
-}
-
-func validateDestinationFunc(ctx context.Context, dest *backendconfig.DestinationT, stepToValidate string) (json.RawMessage, error) {
-	return json.Marshal(validateDestination(ctx, dest, stepToValidate))
-}
-
-func validateDestination(ctx context.Context, dest *backendconfig.DestinationT, stepToValidate string) *model.DestinationValidationResponse {
+func (m *Manager) validateDestination(ctx context.Context, dest *backendconfig.DestinationT, stepToValidate string) *model.DestinationValidationResponse {
 	var (
 		destID          = dest.ID
 		destType        = dest.DestinationDefinition.Name
 		stepsToValidate []*model.Step
-		validator       Validator
 		err             error
 	)
 
-	pkgLogger.Infow("validate destination configuration",
+	m.logger.Infow("validate destination configuration",
 		logfield.DestinationID, destID,
 		logfield.DestinationType, destType,
 		logfield.DestinationRevisionID, dest.RevisionID,
@@ -143,7 +90,7 @@ func validateDestination(ctx context.Context, dest *backendconfig.DestinationT, 
 
 		// get validation step
 		var vs *model.Step
-		for _, s := range StepsToValidate(dest).Steps {
+		for _, s := range m.stepsToValidate(dest).Steps {
 			if s.ID == stepI {
 				vs = s
 				break
@@ -158,16 +105,32 @@ func validateDestination(ctx context.Context, dest *backendconfig.DestinationT, 
 
 		stepsToValidate = append(stepsToValidate, vs)
 	} else {
-		stepsToValidate = append(stepsToValidate, StepsToValidate(dest).Steps...)
+		stepsToValidate = append(stepsToValidate, m.stepsToValidate(dest).Steps...)
 	}
 
 	// Iterate over all selected steps and validate
 	for _, step := range stepsToValidate {
-		if validator, err = NewValidator(ctx, step.Name, dest); err != nil {
-			err = fmt.Errorf("creating validator: %v", err)
+		switch step.Name {
+		case model.VerifyingObjectStorage:
+			err = m.validateObjectStorage(ctx, dest)
+		case model.VerifyingConnections:
+			err = m.validateConnections(ctx, dest)
+		case model.VerifyingCreateSchema:
+			err = m.validateCreateSchema(ctx, dest)
+		case model.VerifyingCreateAndAlterTable:
+			err = m.validateCreateAlterTabl(ctx, dest)
+		case model.VerifyingFetchSchema:
+			err = m.validateFetchSchema(ctx, dest)
+		case model.VerifyingLoadTable:
+			err = m.validateLoadTable(ctx, dest)
+		default:
+			err = fmt.Errorf("invalid step: %s", step.Name)
+		}
+
+		if err != nil {
 			step.Error = err.Error()
 
-			pkgLogger.Warnw("creating validator",
+			m.logger.Warnw("not able to validate destination configuration",
 				logfield.DestinationID, destID,
 				logfield.DestinationType, destType,
 				logfield.DestinationRevisionID, dest.RevisionID,
@@ -176,26 +139,8 @@ func validateDestination(ctx context.Context, dest *backendconfig.DestinationT, 
 				logfield.Error, step.Error,
 			)
 			break
-		}
-
-		if stepError := validator.Validate(ctx); stepError != nil {
-			err = stepError
-			step.Error = stepError.Error()
 		} else {
 			step.Success = true
-		}
-
-		// if any of steps fails, the whole validation fails
-		if !step.Success {
-			pkgLogger.Warnw("not able to validate destination configuration",
-				logfield.DestinationID, destID,
-				logfield.DestinationType, destType,
-				logfield.DestinationRevisionID, dest.RevisionID,
-				logfield.WorkspaceID, dest.WorkspaceID,
-				logfield.DestinationValidationsStep, step.Name,
-				logfield.Error, step.Error,
-			)
-			break
 		}
 	}
 
@@ -210,110 +155,223 @@ func validateDestination(ctx context.Context, dest *backendconfig.DestinationT, 
 	return res
 }
 
-func NewValidator(ctx context.Context, step string, dest *backendconfig.DestinationT) (Validator, error) {
-	var (
-		operations manager.WarehouseOperations
-		err        error
-	)
-
-	switch step {
-	case model.VerifyingObjectStorage:
-		return &objectStorage{
-			destination: dest,
-		}, nil
-	case model.VerifyingConnections:
-		if operations, err = createManager(ctx, dest); err != nil {
-			return nil, fmt.Errorf("create manager: %w", err)
-		}
-		return &connections{
-			destination: dest,
-			manager:     operations,
-		}, nil
-	case model.VerifyingCreateSchema:
-		if operations, err = createManager(ctx, dest); err != nil {
-			return nil, fmt.Errorf("create manager: %w", err)
-		}
-		return &createSchema{
-			manager: operations,
-		}, nil
-	case model.VerifyingCreateAndAlterTable:
-		if operations, err = createManager(ctx, dest); err != nil {
-			return nil, fmt.Errorf("create manager: %w", err)
-		}
-		return &createAlterTable{
-			table:   getTable(dest),
-			manager: operations,
-		}, nil
-	case model.VerifyingFetchSchema:
-		if operations, err = createManager(ctx, dest); err != nil {
-			return nil, fmt.Errorf("create manager: %w", err)
-		}
-		return &fetchSchema{
-			destination: dest,
-			manager:     operations,
-		}, nil
-	case model.VerifyingLoadTable:
-		if operations, err = createManager(ctx, dest); err != nil {
-			return nil, fmt.Errorf("create manager: %w", err)
-		}
-		return &loadTable{
-			destination: dest,
-			manager:     operations,
-			table:       getTable(dest),
-		}, nil
-	}
-
-	return nil, fmt.Errorf("invalid step: %s", step)
-}
-
-func (os *objectStorage) Validate(ctx context.Context) error {
-	var (
-		tempPath     string
-		err          error
-		uploadObject filemanager.UploadedFile
-	)
-
-	if tempPath, err = CreateTempLoadFile(os.destination); err != nil {
+func (m *Manager) validateObjectStorage(ctx context.Context, dest *backendconfig.DestinationT) error {
+	tempPath, err := m.CreateTempLoadFile(dest)
+	if err != nil {
 		return fmt.Errorf("creating temp load file: %w", err)
 	}
 
-	if uploadObject, err = uploadFile(ctx, os.destination, tempPath); err != nil {
+	uploadObject, err := m.uploadFile(ctx, dest, tempPath)
+	if err != nil {
 		return fmt.Errorf("upload file: %w", err)
 	}
 
-	if err = downloadFile(ctx, os.destination, uploadObject.ObjectName); err != nil {
+	err = m.downloadFile(ctx, dest, uploadObject.ObjectName)
+	if err != nil {
 		return fmt.Errorf("download file: %w", err)
 	}
 
 	return nil
 }
 
-func (c *connections) Validate(ctx context.Context) error {
-	defer c.manager.Cleanup(ctx)
+func (m *Manager) uploadFile(ctx context.Context, dest *backendconfig.DestinationT, filePath string) (filemanager.UploadedFile, error) {
+	var (
+		err        error
+		output     filemanager.UploadedFile
+		fm         filemanager.FileManager
+		uploadFile *os.File
+
+		destinationType = dest.DestinationDefinition.Name
+		prefixes        = []string{m.config.connectionTestingFolder, destinationType, warehouseutils.RandHex(), time.Now().Format("01-02-2006")}
+	)
+
+	if fm, err = m.createFileManager(dest); err != nil {
+		return filemanager.UploadedFile{}, err
+	}
+
+	if uploadFile, err = os.Open(filePath); err != nil {
+		return filemanager.UploadedFile{}, fmt.Errorf("opening file: %w", err)
+	}
+
+	// cleanup
+	defer misc.RemoveFilePaths(filePath)
+	defer func() { _ = uploadFile.Close() }()
+
+	if output, err = fm.Upload(ctx, uploadFile, prefixes...); err != nil {
+		return filemanager.UploadedFile{}, fmt.Errorf("uploading file: %w", err)
+	}
+
+	return output, nil
+}
+
+func (m *Manager) createFileManager(dest *backendconfig.DestinationT) (filemanager.FileManager, error) {
+	var (
+		destType = dest.DestinationDefinition.Name
+		conf     = dest.Config
+		provider = warehouseutils.ObjectStorageType(destType, conf, misc.IsConfiguredToUseRudderObjectStorage(conf))
+	)
+
+	fileManager, err := m.fileManagerFactory(&filemanager.Settings{
+		Provider: provider,
+		Config: misc.GetObjectStorageConfig(misc.ObjectStorageOptsT{
+			Provider:         provider,
+			Config:           conf,
+			UseRudderStorage: misc.IsConfiguredToUseRudderObjectStorage(conf),
+			WorkspaceID:      dest.WorkspaceID,
+		}),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating file manager: %w", err)
+	}
+
+	fileManager.SetTimeout(m.config.objectStorageValidationTimeout)
+
+	return fileManager, nil
+}
+
+func (m *Manager) downloadFile(ctx context.Context, dest *backendconfig.DestinationT, location string) error {
+	var (
+		err          error
+		fm           filemanager.FileManager
+		downloadFile *os.File
+		tmpDirPath   string
+		filePath     string
+
+		destinationType = dest.DestinationDefinition.Name
+		loadFileType    = warehouseutils.GetLoadFileType(destinationType)
+	)
+
+	if fm, err = m.createFileManager(dest); err != nil {
+		return err
+	}
+
+	if tmpDirPath, err = misc.CreateTMPDIR(); err != nil {
+		return fmt.Errorf("create tmp dir: %w", err)
+	}
+
+	filePath = fmt.Sprintf("%v/%v/%v.%v.%v.%v",
+		tmpDirPath,
+		m.config.connectionTestingFolder,
+		destinationType,
+		warehouseutils.RandHex(),
+		time.Now().Unix(),
+		warehouseutils.GetLoadFileFormat(loadFileType),
+	)
+	if err = os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+		return fmt.Errorf("create directory: %w", err)
+	}
+
+	if downloadFile, err = os.Create(filePath); err != nil {
+		return fmt.Errorf("creating file: %w", err)
+	}
+
+	// cleanup
+	defer misc.RemoveFilePaths(filePath)
+	defer func() { _ = downloadFile.Close() }()
+
+	if err = fm.Download(ctx, downloadFile, location); err != nil {
+		return fmt.Errorf("downloading file: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) validateConnections(ctx context.Context, dest *backendconfig.DestinationT) error {
+	mgr, err := m.createManager(ctx, dest)
+	if err != nil {
+		return fmt.Errorf("create manager: %w", err)
+	}
+	defer mgr.Cleanup(ctx)
 
 	ctx, cancel := context.WithTimeout(ctx, warehouseutils.TestConnectionTimeout)
 	defer cancel()
 
-	return c.manager.TestConnection(ctx, createDummyWarehouse(c.destination))
+	return mgr.TestConnection(ctx, m.createDummyWarehouse(dest))
 }
 
-func (cs *createSchema) Validate(ctx context.Context) error {
-	defer cs.manager.Cleanup(ctx)
+func (m *Manager) createManager(ctx context.Context, dest *backendconfig.DestinationT) (manager.WarehouseOperations, error) {
+	var (
+		destType  = dest.DestinationDefinition.Name
+		warehouse = m.createDummyWarehouse(dest)
 
-	return cs.manager.CreateSchema(ctx)
+		operations manager.WarehouseOperations
+		err        error
+	)
+
+	if operations, err = manager.NewWarehouseOperations(destType, config.Default, m.logger, stats.Default); err != nil {
+		return nil, fmt.Errorf("getting manager: %w", err)
+	}
+
+	operations.SetConnectionTimeout(warehouseutils.TestConnectionTimeout)
+
+	if err = operations.Setup(ctx, warehouse, &dummyUploader{
+		dest: dest,
+	}); err != nil {
+		return nil, fmt.Errorf("setting up manager: %w", err)
+	}
+
+	return operations, nil
 }
 
-func (cat *createAlterTable) Validate(ctx context.Context) error {
-	defer cat.manager.Cleanup(ctx)
+func (m *Manager) createDummyWarehouse(dest *backendconfig.DestinationT) model.Warehouse {
+	var (
+		destType  = dest.DestinationDefinition.Name
+		namespace = m.configuredNamespaceInDestination(dest)
+	)
 
-	if err := cat.manager.CreateTable(ctx, cat.table, tableSchemaMap); err != nil {
+	return model.Warehouse{
+		WorkspaceID: dest.WorkspaceID,
+		Destination: *dest,
+		Namespace:   namespace,
+		Type:        destType,
+	}
+}
+
+func (m *Manager) configuredNamespaceInDestination(dest *backendconfig.DestinationT) string {
+	var (
+		destType = dest.DestinationDefinition.Name
+		conf     = dest.Config
+	)
+
+	if destType == warehouseutils.CLICKHOUSE {
+		return conf["database"].(string)
+	}
+
+	if conf["namespace"] != nil {
+		namespace := conf["namespace"].(string)
+		if len(strings.TrimSpace(namespace)) > 0 {
+			return warehouseutils.ToProviderCase(destType, warehouseutils.ToSafeNamespace(destType, namespace))
+		}
+	}
+	return warehouseutils.ToProviderCase(destType, warehouseutils.ToSafeNamespace(destType, namespace))
+}
+
+func (m *Manager) validateCreateSchema(ctx context.Context, dest *backendconfig.DestinationT) error {
+	mgr, err := m.createManager(ctx, dest)
+	if err != nil {
+		return fmt.Errorf("create manager: %w", err)
+	}
+	defer mgr.Cleanup(ctx)
+
+	return mgr.CreateSchema(ctx)
+}
+
+func (m *Manager) validateCreateAlterTabl(ctx context.Context, dest *backendconfig.DestinationT) error {
+	mgr, err := m.createManager(ctx, dest)
+	if err != nil {
+		return fmt.Errorf("create manager: %w", err)
+	}
+	defer mgr.Cleanup(ctx)
+
+	table := m.getTable(dest)
+
+	if err := mgr.CreateTable(ctx, table, tableSchemaMap); err != nil {
 		return fmt.Errorf("create table: %w", err)
 	}
 
-	defer func() { _ = cat.manager.DropTable(ctx, cat.table) }()
+	defer func() { _ = mgr.DropTable(ctx, table) }()
 
 	for columnName, columnType := range alterColumnMap {
-		if err := cat.manager.AddColumns(ctx, cat.table, []warehouseutils.ColumnInfo{{Name: columnName, Type: columnType}}); err != nil {
+		if err := mgr.AddColumns(ctx, table, []warehouseutils.ColumnInfo{{Name: columnName, Type: columnType}}); err != nil {
 			return fmt.Errorf("alter table: %w", err)
 		}
 	}
@@ -321,50 +379,71 @@ func (cat *createAlterTable) Validate(ctx context.Context) error {
 	return nil
 }
 
-func (fs *fetchSchema) Validate(ctx context.Context) error {
-	defer fs.manager.Cleanup(ctx)
+func (m *Manager) getTable(dest *backendconfig.DestinationT) string {
+	destType := dest.DestinationDefinition.Name
+	conf := dest.Config
 
-	if _, _, err := fs.manager.FetchSchema(ctx); err != nil {
+	if destType == warehouseutils.DELTALAKE {
+		enableExternalLocation, _ := conf["enableExternalLocation"].(bool)
+		externalLocation, _ := conf["externalLocation"].(string)
+		if enableExternalLocation && externalLocation != "" {
+			return m.tableWithUUID()
+		}
+	}
+
+	return table
+}
+
+func (m *Manager) tableWithUUID() string {
+	return table + "_" + warehouseutils.RandHex()
+}
+
+func (m *Manager) validateFetchSchema(ctx context.Context, dest *backendconfig.DestinationT) error {
+	mgr, err := m.createManager(ctx, dest)
+	if err != nil {
+		return fmt.Errorf("create manager: %w", err)
+	}
+	defer mgr.Cleanup(ctx)
+
+	if _, _, err := mgr.FetchSchema(ctx); err != nil {
 		return fmt.Errorf("fetch schema: %w", err)
 	}
 	return nil
 }
 
-func (lt *loadTable) Validate(ctx context.Context) error {
-	var (
-		destinationType = lt.destination.DestinationDefinition.Name
-		loadFileType    = warehouseutils.GetLoadFileType(destinationType)
+func (m *Manager) validateLoadTable(ctx context.Context, dest *backendconfig.DestinationT) error {
+	mgr, err := m.createManager(ctx, dest)
+	if err != nil {
+		return fmt.Errorf("create manager: %w", err)
+	}
+	defer mgr.Cleanup(ctx)
 
-		tempPath     string
-		uploadOutput filemanager.UploadedFile
-		err          error
-	)
+	table := m.getTable(dest)
 
-	defer lt.manager.Cleanup(ctx)
-
-	if tempPath, err = CreateTempLoadFile(lt.destination); err != nil {
+	tempPath, err := m.CreateTempLoadFile(dest)
+	if err != nil {
 		return fmt.Errorf("create temp load file: %w", err)
 	}
 
-	if uploadOutput, err = uploadFile(ctx, lt.destination, tempPath); err != nil {
+	uploadOutput, err := m.uploadFile(ctx, dest, tempPath)
+	if err != nil {
 		return fmt.Errorf("upload file: %w", err)
 	}
 
-	if err = lt.manager.CreateTable(ctx, lt.table, tableSchemaMap); err != nil {
+	if err := mgr.CreateTable(ctx, table, tableSchemaMap); err != nil {
 		return fmt.Errorf("create table: %w", err)
 	}
+	defer func() { _ = mgr.DropTable(ctx, table) }()
 
-	defer func() { _ = lt.manager.DropTable(ctx, lt.table) }()
-
-	if err = lt.manager.LoadTestTable(ctx, uploadOutput.Location, lt.table, payloadMap, loadFileType); err != nil {
+	err = mgr.LoadTestTable(ctx, uploadOutput.Location, table, payloadMap, warehouseutils.GetLoadFileType(dest.DestinationDefinition.Name))
+	if err != nil {
 		return fmt.Errorf("load test table: %w", err)
 	}
 
 	return nil
 }
 
-// CreateTempLoadFile creates a temporary load file
-func CreateTempLoadFile(dest *backendconfig.DestinationT) (string, error) {
+func (m *Manager) CreateTempLoadFile(dest *backendconfig.DestinationT) (string, error) {
 	var (
 		tmpDirPath string
 		filePath   string
@@ -381,7 +460,7 @@ func CreateTempLoadFile(dest *backendconfig.DestinationT) (string, error) {
 
 	filePath = fmt.Sprintf("%v/%v/%v.%v.%v.%v",
 		tmpDirPath,
-		connectionTestingFolder,
+		m.config.connectionTestingFolder,
 		destinationType,
 		warehouseutils.RandHex(),
 		time.Now().Unix(),
@@ -414,181 +493,4 @@ func CreateTempLoadFile(dest *backendconfig.DestinationT) (string, error) {
 	}
 
 	return filePath, nil
-}
-
-func uploadFile(ctx context.Context, dest *backendconfig.DestinationT, filePath string) (filemanager.UploadedFile, error) {
-	var (
-		err        error
-		output     filemanager.UploadedFile
-		fm         filemanager.FileManager
-		uploadFile *os.File
-
-		destinationType = dest.DestinationDefinition.Name
-		prefixes        = []string{connectionTestingFolder, destinationType, warehouseutils.RandHex(), time.Now().Format("01-02-2006")}
-	)
-
-	if fm, err = createFileManager(dest); err != nil {
-		return filemanager.UploadedFile{}, err
-	}
-
-	if uploadFile, err = os.Open(filePath); err != nil {
-		return filemanager.UploadedFile{}, fmt.Errorf("opening file: %w", err)
-	}
-
-	// cleanup
-	defer misc.RemoveFilePaths(filePath)
-	defer func() { _ = uploadFile.Close() }()
-
-	if output, err = fm.Upload(ctx, uploadFile, prefixes...); err != nil {
-		return filemanager.UploadedFile{}, fmt.Errorf("uploading file: %w", err)
-	}
-
-	return output, nil
-}
-
-func downloadFile(ctx context.Context, dest *backendconfig.DestinationT, location string) error {
-	var (
-		err          error
-		fm           filemanager.FileManager
-		downloadFile *os.File
-		tmpDirPath   string
-		filePath     string
-
-		destinationType = dest.DestinationDefinition.Name
-		loadFileType    = warehouseutils.GetLoadFileType(destinationType)
-	)
-
-	if fm, err = createFileManager(dest); err != nil {
-		return err
-	}
-
-	if tmpDirPath, err = misc.CreateTMPDIR(); err != nil {
-		return fmt.Errorf("create tmp dir: %w", err)
-	}
-
-	filePath = fmt.Sprintf("%v/%v/%v.%v.%v.%v",
-		tmpDirPath,
-		connectionTestingFolder,
-		destinationType,
-		warehouseutils.RandHex(),
-		time.Now().Unix(),
-		warehouseutils.GetLoadFileFormat(loadFileType),
-	)
-	if err = os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
-		return fmt.Errorf("create directory: %w", err)
-	}
-
-	if downloadFile, err = os.Create(filePath); err != nil {
-		return fmt.Errorf("creating file: %w", err)
-	}
-
-	// cleanup
-	defer misc.RemoveFilePaths(filePath)
-	defer func() { _ = downloadFile.Close() }()
-
-	if err = fm.Download(ctx, downloadFile, location); err != nil {
-		return fmt.Errorf("downloading file: %w", err)
-	}
-	return nil
-}
-
-func createFileManager(dest *backendconfig.DestinationT) (filemanager.FileManager, error) {
-	var (
-		destType = dest.DestinationDefinition.Name
-		conf     = dest.Config
-		provider = warehouseutils.ObjectStorageType(destType, conf, misc.IsConfiguredToUseRudderObjectStorage(conf))
-	)
-
-	fileManager, err := fileManagerFactory(&filemanager.Settings{
-		Provider: provider,
-		Config: misc.GetObjectStorageConfig(misc.ObjectStorageOptsT{
-			Provider:         provider,
-			Config:           conf,
-			UseRudderStorage: misc.IsConfiguredToUseRudderObjectStorage(conf),
-			WorkspaceID:      dest.WorkspaceID,
-		}),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating file manager: %w", err)
-	}
-
-	fileManager.SetTimeout(objectStorageValidationTimeout)
-
-	return fileManager, nil
-}
-
-func createManager(ctx context.Context, dest *backendconfig.DestinationT) (manager.WarehouseOperations, error) {
-	var (
-		destType  = dest.DestinationDefinition.Name
-		warehouse = createDummyWarehouse(dest)
-
-		operations manager.WarehouseOperations
-		err        error
-	)
-
-	if operations, err = manager.NewWarehouseOperations(destType, config.Default, pkgLogger, stats.Default); err != nil {
-		return nil, fmt.Errorf("getting manager: %w", err)
-	}
-
-	operations.SetConnectionTimeout(warehouseutils.TestConnectionTimeout)
-
-	if err = operations.Setup(ctx, warehouse, &dummyUploader{
-		dest: dest,
-	}); err != nil {
-		return nil, fmt.Errorf("setting up manager: %w", err)
-	}
-
-	return operations, nil
-}
-
-func createDummyWarehouse(dest *backendconfig.DestinationT) model.Warehouse {
-	var (
-		destType  = dest.DestinationDefinition.Name
-		namespace = configuredNamespaceInDestination(dest)
-	)
-
-	return model.Warehouse{
-		WorkspaceID: dest.WorkspaceID,
-		Destination: *dest,
-		Namespace:   namespace,
-		Type:        destType,
-	}
-}
-
-func configuredNamespaceInDestination(dest *backendconfig.DestinationT) string {
-	var (
-		destType = dest.DestinationDefinition.Name
-		conf     = dest.Config
-	)
-
-	if destType == warehouseutils.CLICKHOUSE {
-		return conf["database"].(string)
-	}
-
-	if conf["namespace"] != nil {
-		namespace := conf["namespace"].(string)
-		if len(strings.TrimSpace(namespace)) > 0 {
-			return warehouseutils.ToProviderCase(destType, warehouseutils.ToSafeNamespace(destType, namespace))
-		}
-	}
-	return warehouseutils.ToProviderCase(destType, warehouseutils.ToSafeNamespace(destType, namespace))
-}
-
-func getTable(dest *backendconfig.DestinationT) string {
-	destType := dest.DestinationDefinition.Name
-	conf := dest.Config
-
-	if destType == warehouseutils.DELTALAKE {
-		enableExternalLocation, _ := conf["enableExternalLocation"].(bool)
-		externalLocation, _ := conf["externalLocation"].(string)
-		if enableExternalLocation && externalLocation != "" {
-			return tableWithUUID()
-		}
-	}
-
-	return table
-}
-
-func tableWithUUID() string {
-	return table + "_" + warehouseutils.RandHex()
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"github.com/rudderlabs/rudder-server/warehouse/validations"
 	"io"
 	"net/http"
 	"os"
@@ -64,6 +65,7 @@ var (
 	lastProcessedMarkerMapLock sync.RWMutex
 	warehouseMode              string
 	bcManager                  *backendConfigManager
+	validationsManager         *validations.Manager
 	triggerUploadsMap          map[string]bool // `whType:sourceID:destinationID` -> boolean value representing if an upload was triggered or not
 	triggerUploadsMapLock      sync.RWMutex
 	pkgLogger                  logger.Logger
@@ -201,6 +203,7 @@ func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.C
 					tenantManager,
 					controlPlaneClient,
 					bcManager,
+					validationsManager,
 				)
 				if err != nil {
 					return fmt.Errorf("setup warehouse %q: %w", destination.DestinationDefinition.Name, err)
@@ -781,7 +784,9 @@ func Start(ctx context.Context, app app.App) error {
 		return nil
 	})
 
-	RegisterAdmin(bcManager, pkgLogger)
+	validationsManager = validations.NewManager(config.Default, pkgLogger, filemanager.New)
+
+	RegisterAdmin(bcManager, validationsManager, pkgLogger)
 
 	runningMode := config.GetString("Warehouse.runningMode", "")
 	if runningMode == DegradedMode {

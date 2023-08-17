@@ -1,15 +1,16 @@
-package validations_test
+package validations
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"testing"
 
 	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
 	"github.com/rudderlabs/rudder-server/warehouse/encoding"
-
-	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 
 	"github.com/ory/dockertest/v3"
 	"github.com/stretchr/testify/require"
@@ -19,7 +20,6 @@ import (
 	"github.com/rudderlabs/rudder-server/testhelper/destination"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
-	"github.com/rudderlabs/rudder-server/warehouse/validations"
 )
 
 type testResource struct {
@@ -65,7 +65,6 @@ func TestValidator(t *testing.T) {
 	misc.Init()
 	warehouseutils.Init()
 	encoding.Init()
-	validations.Init()
 
 	var (
 		provider  = "MINIO"
@@ -86,7 +85,9 @@ func TestValidator(t *testing.T) {
 			tr := setup(t, pool)
 			pgResource, minioResource := tr.pgResource, tr.minioResource
 
-			v, err := validations.NewValidator(ctx, model.VerifyingObjectStorage, &backendconfig.DestinationT{
+			vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+			err := vm.validateObjectStorage(ctx, &backendconfig.DestinationT{
 				DestinationDefinition: backendconfig.DestinationDefinitionT{
 					Name: warehouseutils.POSTGRES,
 				},
@@ -104,7 +105,6 @@ func TestValidator(t *testing.T) {
 				},
 			})
 			require.NoError(t, err)
-			require.NoError(t, v.Validate(ctx))
 		})
 
 		t.Run("Datalakes", func(t *testing.T) {
@@ -120,7 +120,9 @@ func TestValidator(t *testing.T) {
 
 			_ = minioResource.Client.MakeBucket(bucket, "us-east-1")
 
-			v, err := validations.NewValidator(ctx, model.VerifyingObjectStorage, &backendconfig.DestinationT{
+			vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+			err := vm.validateObjectStorage(ctx, &backendconfig.DestinationT{
 				DestinationDefinition: backendconfig.DestinationDefinitionT{
 					Name: warehouseutils.S3Datalake,
 				},
@@ -138,7 +140,6 @@ func TestValidator(t *testing.T) {
 				},
 			})
 			require.NoError(t, err)
-			require.NoError(t, v.Validate(ctx))
 		})
 	})
 
@@ -187,18 +188,18 @@ func TestValidator(t *testing.T) {
 					conf[k] = v
 				}
 
-				v, err := validations.NewValidator(ctx, model.VerifyingConnections, &backendconfig.DestinationT{
+				vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+				err := vm.validateConnections(ctx, &backendconfig.DestinationT{
 					DestinationDefinition: backendconfig.DestinationDefinitionT{
 						Name: warehouseutils.POSTGRES,
 					},
 					Config: conf,
 				})
-				require.NoError(t, err)
-
 				if tc.wantError != nil {
-					require.EqualError(t, v.Validate(ctx), tc.wantError.Error())
+					require.EqualError(t, err, tc.wantError.Error())
 				} else {
-					require.NoError(t, v.Validate(ctx))
+					require.NoError(t, err)
 				}
 			})
 		}
@@ -263,18 +264,18 @@ func TestValidator(t *testing.T) {
 					conf[k] = v
 				}
 
-				v, err := validations.NewValidator(ctx, model.VerifyingCreateSchema, &backendconfig.DestinationT{
+				vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+				err := vm.validateCreateSchema(ctx, &backendconfig.DestinationT{
 					DestinationDefinition: backendconfig.DestinationDefinitionT{
 						Name: warehouseutils.POSTGRES,
 					},
 					Config: conf,
 				})
-				require.NoError(t, err)
-
 				if tc.wantError != nil {
-					require.EqualError(t, v.Validate(ctx), tc.wantError.Error())
+					require.EqualError(t, err, tc.wantError.Error())
 				} else {
-					require.NoError(t, v.Validate(ctx))
+					require.NoError(t, err)
 				}
 			})
 		}
@@ -370,7 +371,9 @@ func TestValidator(t *testing.T) {
 					conf[k] = v
 				}
 
-				v, err := validations.NewValidator(ctx, model.VerifyingCreateAndAlterTable, &backendconfig.DestinationT{
+				vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+				err := vm.validateCreateAlterTabl(ctx, &backendconfig.DestinationT{
 					DestinationDefinition: backendconfig.DestinationDefinitionT{
 						Name: warehouseutils.POSTGRES,
 					},
@@ -379,9 +382,9 @@ func TestValidator(t *testing.T) {
 				require.NoError(t, err)
 
 				if tc.wantError != nil {
-					require.EqualError(t, v.Validate(ctx), tc.wantError.Error())
+					require.EqualError(t, err, tc.wantError.Error())
 				} else {
-					require.NoError(t, v.Validate(ctx))
+					require.NoError(t, err)
 				}
 
 				_, err = pgResource.DB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s.setup_test_staging", namespace))
@@ -394,7 +397,15 @@ func TestValidator(t *testing.T) {
 		tr := setup(t, pool)
 		pgResource, minioResource := tr.pgResource, tr.minioResource
 
-		v, err := validations.NewValidator(ctx, model.VerifyingFetchSchema, &backendconfig.DestinationT{
+		_, err = pgResource.DB.Exec(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", namespace))
+		require.NoError(t, err)
+
+		_, err = pgResource.DB.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s(id int, val varchar)", namespace, table))
+		require.NoError(t, err)
+
+		vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+		err := vm.validateFetchSchema(ctx, &backendconfig.DestinationT{
 			DestinationDefinition: backendconfig.DestinationDefinitionT{
 				Name: warehouseutils.POSTGRES,
 			},
@@ -414,14 +425,6 @@ func TestValidator(t *testing.T) {
 			},
 		})
 		require.NoError(t, err)
-
-		_, err = pgResource.DB.Exec(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", namespace))
-		require.NoError(t, err)
-
-		_, err = pgResource.DB.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s(id int, val varchar)", namespace, table))
-		require.NoError(t, err)
-
-		require.NoError(t, v.Validate(ctx))
 	})
 
 	t.Run("Load table", func(t *testing.T) {
@@ -526,18 +529,19 @@ func TestValidator(t *testing.T) {
 					conf[k] = v
 				}
 
-				v, err := validations.NewValidator(ctx, model.VerifyingLoadTable, &backendconfig.DestinationT{
+				vm := NewManager(config.Default, logger.NOP, filemanager.New)
+
+				err := vm.validateLoadTable(ctx, &backendconfig.DestinationT{
 					DestinationDefinition: backendconfig.DestinationDefinitionT{
 						Name: warehouseutils.POSTGRES,
 					},
 					Config: conf,
 				})
-				require.NoError(t, err)
 
 				if tc.wantError != nil {
-					require.EqualError(t, v.Validate(ctx), tc.wantError.Error())
+					require.EqualError(t, err, tc.wantError.Error())
 				} else {
-					require.NoError(t, v.Validate(ctx))
+					require.NoError(t, err)
 				}
 
 				_, err = pgResource.DB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s.setup_test_staging", namespace))

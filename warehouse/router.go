@@ -72,10 +72,11 @@ type router struct {
 	backgroundGroup errgroup.Group
 	backgroundWait  func() error
 
-	tenantManager    *multitenant.Manager
-	bcManager        *backendConfigManager
-	uploadJobFactory UploadJobFactory
-	notifier         *pgnotifier.PGNotifier
+	tenantManager      *multitenant.Manager
+	bcManager          *backendConfigManager
+	uploadJobFactory   UploadJobFactory
+	notifier           *pgnotifier.PGNotifier
+	validationsManager *validations.Manager
 
 	config struct {
 		noOfWorkers                       int
@@ -115,6 +116,7 @@ func newRouter(
 	tenantManager *multitenant.Manager,
 	controlPlaneClient *controlplane.Client,
 	bcManager *backendConfigManager,
+	validationsManager *validations.Manager,
 ) (*router, error) {
 	r := &router{}
 
@@ -134,6 +136,7 @@ func newRouter(
 
 	r.notifier = pgNotifier
 	r.tenantManager = tenantManager
+	r.validationsManager = validationsManager
 	r.bcManager = bcManager
 	r.destType = destType
 	r.now = time.Now
@@ -146,13 +149,13 @@ func newRouter(
 	r.inProgressMap = make(map[WorkerIdentifierT][]JobID)
 
 	r.uploadJobFactory = UploadJobFactory{
-		app:                  app,
-		conf:                 r.conf,
-		logger:               r.logger,
-		statsFactory:         r.statsFactory,
-		dbHandle:             r.dbHandle,
-		pgNotifier:           r.notifier,
-		destinationValidator: validations.NewDestinationValidator(),
+		app:                app,
+		conf:               r.conf,
+		logger:             r.logger,
+		statsFactory:       r.statsFactory,
+		dbHandle:           r.dbHandle,
+		pgNotifier:         r.notifier,
+		validationsManager: r.validationsManager,
 		loadFile: &loadfiles.LoadFileGenerator{
 			Logger:             r.logger.Child("loadfile"),
 			Notifier:           r.notifier,

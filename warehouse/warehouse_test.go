@@ -9,7 +9,6 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
 	"github.com/rudderlabs/rudder-server/admin"
 	"github.com/rudderlabs/rudder-server/utils/misc"
-	"github.com/rudderlabs/rudder-server/warehouse/validations"
 )
 
 type testingT interface { // TODO replace with testing.TB
@@ -40,6 +39,5 @@ func initWarehouse() {
 	admin.Init()
 	logger.Reset()
 	Init4()
-	validations.Init()
 	misc.Init()
 }

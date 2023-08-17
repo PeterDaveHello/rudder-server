@@ -22,8 +22,9 @@ import (
 
 type warehouseGRPC struct {
 	proto.UnimplementedWarehouseServer
-	CPClient         controlplane.InternalControlPlane
-	EnableTunnelling bool
+	cpClient           controlplane.InternalControlPlane
+	enableTunnelling   bool
+	validationsManager validations.Manager
 }
 
 func (*warehouseGRPC) GetWHUploads(ctx context.Context, request *proto.WHUploadsRequest) (*proto.WHUploadsResponse, error) {
@@ -108,7 +109,7 @@ func (grpc *warehouseGRPC) manageTunnellingSecrets(ctx context.Context, config m
 		return fmt.Errorf("missing sshKeyId in validation payload")
 	}
 
-	keys, err := grpc.CPClient.GetSSHKeys(ctx, sshKeyId.(string))
+	keys, err := grpc.cpClient.GetSSHKeys(ctx, sshKeyId.(string))
 	if err != nil {
 		return fmt.Errorf("fetching destination ssh keys: %w", err)
 	}
@@ -137,14 +138,14 @@ func (grpc *warehouseGRPC) Validate(ctx context.Context, req *proto.WHValidation
 
 	// adding ssh tunnelling info, given we have
 	// useSSH enabled from upstream
-	if grpc.EnableTunnelling {
+	if grpc.enableTunnelling {
 		err = grpc.manageTunnellingSecrets(ctx, destination.Config)
 		if err != nil {
 			return &proto.WHValidationResponse{}, fmt.Errorf("fetching destination ssh keys: %w", err)
 		}
 	}
 
-	res, err := validations.Validate(ctx, &model.ValidationRequest{
+	res, err := grpc.validationsManager.Validate(ctx, &model.ValidationRequest{
 		Path:        req.Path,
 		Step:        req.Step,
 		Destination: &destination,
@@ -154,8 +155,7 @@ func (grpc *warehouseGRPC) Validate(ctx context.Context, req *proto.WHValidation
 	}
 
 	return &proto.WHValidationResponse{
-		Error: res.Error,
-		Data:  res.Data,
+		Data: string(res),
 	}, nil
 }
 
@@ -225,7 +225,7 @@ func validateObjectStorageRequestBody(request *proto.ValidateObjectStorageReques
 	return r, nil
 }
 
-func (*warehouseGRPC) ValidateObjectStorageDestination(ctx context.Context, request *proto.ValidateObjectStorageRequest) (response *proto.ValidateObjectStorageResponse, err error) {
+func (g *warehouseGRPC) ValidateObjectStorageDestination(ctx context.Context, request *proto.ValidateObjectStorageRequest) (response *proto.ValidateObjectStorageResponse, err error) {
 	r, err := validateObjectStorageRequestBody(request)
 	if err != nil {
 		return nil, err
@@ -234,7 +234,7 @@ func (*warehouseGRPC) ValidateObjectStorageDestination(ctx context.Context, requ
 		"[ValidateObjectStorageDestination] Validating object storage destination for type: %s",
 		r.Type,
 	)
-	err = validateObjectStorage(ctx, r)
+	err = validateObjectStorage(ctx, g.validationsManager, r)
 	if err != nil {
 
 		if errors.As(err, &InvalidDestinationCredErr{}) {

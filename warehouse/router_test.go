@@ -3,6 +3,8 @@ package warehouse
 import (
 	"context"
 	"fmt"
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	"github.com/rudderlabs/rudder-server/warehouse/validations"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -112,6 +114,8 @@ func TestRouter(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
+		vm := validations.NewManager(config.Default, pkgLogger, filemanager.New)
+
 		r, err := newRouter(
 			ctx,
 			mockApp,
@@ -124,6 +128,7 @@ func TestRouter(t *testing.T) {
 			tenantManager,
 			cp,
 			bcm,
+			vm,
 		)
 		require.NoError(t, err)
 

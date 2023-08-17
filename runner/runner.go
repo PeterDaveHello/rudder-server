@@ -49,7 +49,6 @@ import (
 	"github.com/rudderlabs/rudder-server/warehouse"
 	"github.com/rudderlabs/rudder-server/warehouse/encoding"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
-	"github.com/rudderlabs/rudder-server/warehouse/validations"
 )
 
 var (
@@ -337,7 +336,6 @@ func runAllInit() {
 	jobsdb.Init()
 	jobsdb.Init2()
 	warehouse.Init4()
-	validations.Init()
 	webhook.Init()
 	asyncdestinationmanager.Init()
 	batchrouterutils.Init()

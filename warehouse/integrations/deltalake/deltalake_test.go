@@ -24,8 +24,6 @@ import (
 
 	"github.com/rudderlabs/rudder-server/warehouse/encoding"
 
-	"github.com/rudderlabs/rudder-server/warehouse/validations"
-
 	"github.com/rudderlabs/rudder-server/utils/misc"
 
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
@@ -81,7 +79,6 @@ func TestIntegration(t *testing.T) {
 	c.Start(context.Background())
 
 	misc.Init()
-	validations.Init()
 	warehouseutils.Init()
 	encoding.Init()
 

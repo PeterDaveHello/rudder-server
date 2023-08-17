@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -68,22 +67,22 @@ type uploadState struct {
 type tableNameT string
 
 type UploadJobFactory struct {
-	app                  app.App
-	dbHandle             *sqlquerywrapper.DB
-	destinationValidator validations.DestinationValidator
-	loadFile             *loadfiles.LoadFileGenerator
-	recovery             *service.Recovery
-	pgNotifier           *pgnotifier.PGNotifier
-	conf                 *config.Config
-	logger               logger.Logger
-	statsFactory         stats.Stats
+	app                app.App
+	dbHandle           *sqlquerywrapper.DB
+	validationsManager *validations.Manager
+	loadFile           *loadfiles.LoadFileGenerator
+	recovery           *service.Recovery
+	pgNotifier         *pgnotifier.PGNotifier
+	conf               *config.Config
+	logger             logger.Logger
+	statsFactory       stats.Stats
 }
 
 type UploadJob struct {
 	app                  app.App
 	ctx                  context.Context
 	dbHandle             *sqlmiddleware.DB
-	destinationValidator validations.DestinationValidator
+	validationsManager   *validations.Manager
 	loadfile             *loadfiles.LoadFileGenerator
 	tableUploadsRepo     *repo.TableUploads
 	recovery             *service.Recovery
@@ -174,18 +173,18 @@ func init() {
 
 func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJob, whManager manager.Manager) *UploadJob {
 	uj := &UploadJob{
-		ctx:                  ctx,
-		app:                  f.app,
-		dbHandle:             f.dbHandle,
-		loadfile:             f.loadFile,
-		recovery:             f.recovery,
-		pgNotifier:           f.pgNotifier,
-		whManager:            whManager,
-		destinationValidator: f.destinationValidator,
-		conf:                 f.conf,
-		logger:               f.logger,
-		statsFactory:         f.statsFactory,
-		tableUploadsRepo:     repo.NewTableUploads(f.dbHandle),
+		ctx:                ctx,
+		app:                f.app,
+		dbHandle:           f.dbHandle,
+		loadfile:           f.loadFile,
+		recovery:           f.recovery,
+		pgNotifier:         f.pgNotifier,
+		whManager:          whManager,
+		validationsManager: f.validationsManager,
+		conf:               f.conf,
+		logger:             f.logger,
+		statsFactory:       f.statsFactory,
+		tableUploadsRepo:   repo.NewTableUploads(f.dbHandle),
 		schemaHandle: NewSchema(
 			f.dbHandle,
 			dto.Warehouse,
@@ -1816,10 +1815,7 @@ func (job *UploadJob) durationBeforeNextAttempt(attempt int64) time.Duration { /
 }
 
 func (job *UploadJob) validateDestinationCredentials() (bool, error) {
-	if job.destinationValidator == nil {
-		return false, errors.New("failed to validate as destinationValidator is not set")
-	}
-	response := job.destinationValidator.Validate(job.ctx, &job.warehouse.Destination)
+	response := job.validationsManager.ValidateAllSteps(job.ctx, &job.warehouse.Destination)
 	return response.Success, nil
 }
 

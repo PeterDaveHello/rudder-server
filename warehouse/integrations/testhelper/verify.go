@@ -6,6 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"io"
 	"net/http"
 	"strconv"
@@ -286,7 +289,8 @@ func VerifyConfigurationTest(t testing.TB, destination backendconfig.Destination
 	t.Logf("Started configuration tests for destination type: %s", destination.DestinationDefinition.Name)
 
 	require.NoError(t, WithConstantRetries(func() error {
-		response := validations.NewDestinationValidator().Validate(context.Background(), &destination)
+		validationsManager := validations.NewManager(config.Default, logger.NOP, filemanager.New)
+		response := validationsManager.ValidateAllSteps(context.Background(), &destination)
 		if !response.Success {
 			return fmt.Errorf("failed to validate credentials for destination: %s with error: %s", destination.DestinationDefinition.Name, response.Error)
 		}

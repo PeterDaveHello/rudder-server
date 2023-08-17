@@ -37,10 +37,8 @@ import (
 
 	"github.com/rudderlabs/rudder-server/warehouse/integrations/testhelper"
 
-	"github.com/rudderlabs/rudder-server/utils/misc"
-	"github.com/rudderlabs/rudder-server/warehouse/validations"
-
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	"github.com/rudderlabs/rudder-server/utils/misc"
 
 	"github.com/stretchr/testify/require"
 
@@ -92,7 +90,6 @@ func TestIntegration(t *testing.T) {
 	c.Start(context.Background())
 
 	misc.Init()
-	validations.Init()
 	warehouseutils.Init()
 	encoding.Init()
 

@@ -21,8 +21,9 @@ import (
 )
 
 type Admin struct {
-	bcManager *backendConfigManager
-	logger    logger.Logger
+	bcManager          *backendConfigManager
+	validationsManager *validations.Manager
+	logger             logger.Logger
 }
 
 type QueryInput struct {
@@ -40,10 +41,11 @@ type ConfigurationTestOutput struct {
 	Error string
 }
 
-func RegisterAdmin(bcManager *backendConfigManager, logger logger.Logger) {
+func RegisterAdmin(bcManager *backendConfigManager, validationsManager *validations.Manager, logger logger.Logger) {
 	admin.RegisterAdminHandler("Warehouse", &Admin{
-		bcManager: bcManager,
-		logger:    logger.Child("admin"),
+		bcManager:          bcManager,
+		validationsManager: validationsManager,
+		logger:             logger.Child("admin"),
 	})
 }
 
@@ -122,8 +124,7 @@ func (a *Admin) ConfigurationTest(s ConfigurationTestInput, reply *Configuration
 
 	a.logger.Infof(`[WH Admin]: Validating warehouse destination: %s:%s`, warehouse.Type, warehouse.Destination.ID)
 
-	destinationValidator := validations.NewDestinationValidator()
-	res := destinationValidator.Validate(context.TODO(), &warehouse.Destination)
+	res := a.validationsManager.ValidateAllSteps(context.TODO(), &warehouse.Destination)
 
 	reply.Valid = res.Success
 	reply.Error = res.Error

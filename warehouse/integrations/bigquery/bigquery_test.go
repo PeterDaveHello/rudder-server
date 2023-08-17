@@ -29,7 +29,6 @@ import (
 	bqHelper "github.com/rudderlabs/rudder-server/warehouse/integrations/bigquery/testhelper"
 	"github.com/rudderlabs/rudder-server/warehouse/integrations/testhelper"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
-	"github.com/rudderlabs/rudder-server/warehouse/validations"
 )
 
 func TestIntegration(t *testing.T) {
@@ -44,7 +43,6 @@ func TestIntegration(t *testing.T) {
 	c.Start(context.Background())
 
 	misc.Init()
-	validations.Init()
 	warehouseutils.Init()
 	encoding.Init()
 
