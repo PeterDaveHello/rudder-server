@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"expvar"
 	"fmt"
 	"os"
 	"strconv"
@@ -34,36 +33,105 @@ import (
 	"github.com/rudderlabs/rudder-server/utils/timeutil"
 	"github.com/rudderlabs/rudder-server/utils/types"
 	"github.com/rudderlabs/rudder-server/warehouse/archive"
-	"github.com/rudderlabs/rudder-server/warehouse/integrations/middleware/sqlquerywrapper"
+	sqlmw "github.com/rudderlabs/rudder-server/warehouse/integrations/middleware/sqlquerywrapper"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	"github.com/rudderlabs/rudder-server/warehouse/jobs"
 	"github.com/rudderlabs/rudder-server/warehouse/multitenant"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
 
+type App struct {
+	app                app.App
+	conf               *config.Config
+	logger             logger.Logger
+	stats              stats.Stats
+	bcConfig           backendconfig.BackendConfig
+	db                 *sqlmw.DB
+	notifier           *pgnotifier.PGNotifier
+	tenantManager      *multitenant.Manager
+	controlPlaneClient *controlplane.Client
+	bcManager          *backendConfigManager
+	encodingFactory    *encoding.Factory
+	jobsManager        *jobs.AsyncJobWh
+
+	lastProcessedMarkerMap     map[string]int64
+	lastProcessedMarkerMapLock sync.RWMutex
+	triggerUploadsMap          map[string]bool // `whType:sourceID:destinationID` -> boolean value representing if an upload was triggered or not
+	triggerUploadsMapLock      sync.RWMutex
+
+	appName string
+
+	config struct {
+		host     string
+		user     string
+		password string
+		database string
+		sslMode  string
+		port     int
+
+		warehouseMode              string
+		runningMode                string
+		uploadFreqInS              int64
+		shouldForceSetLowerVersion bool
+		dbQueryTimeout             time.Duration
+		maxOpenConnections         int
+
+		configBackendURL string
+		region           string
+	}
+}
+
+func NewApp(
+	app app.App,
+	conf *config.Config,
+	log logger.Logger,
+	stats stats.Stats,
+) *App {
+	a := &App{
+		app:                    app,
+		conf:                   conf,
+		logger:                 log,
+		stats:                  stats,
+		lastProcessedMarkerMap: map[string]int64{},
+		triggerUploadsMap:      map[string]bool{},
+	}
+
+	a.conf.RegisterInt64ConfigVariable(1800, &a.config.uploadFreqInS, true, 1, "Warehouse.uploadFreqInS")
+	a.conf.RegisterDurationConfigVariable(5, &a.config.dbQueryTimeout, true, time.Minute, []string{"Warehouse.dbHandleTimeout", "Warehouse.dbHanndleTimeoutInMin"}...)
+
+	a.config.host = conf.GetString("WAREHOUSE_JOBS_DB_HOST", "localhost")
+	a.config.user = conf.GetString("WAREHOUSE_JOBS_DB_USER", "ubuntu")
+	a.config.password = conf.GetString("WAREHOUSE_JOBS_DB_PASSWORD", "ubuntu")
+	a.config.database = conf.GetString("WAREHOUSE_JOBS_DB_DB_NAME", "ubuntu")
+	a.config.sslMode = conf.GetString("WAREHOUSE_JOBS_DB_SSL_MODE", "disable")
+	a.config.port = conf.GetInt("WAREHOUSE_JOBS_DB_PORT", 5432)
+	a.config.warehouseMode = conf.GetString("Warehouse.mode", "embedded")
+	a.config.runningMode = conf.GetString("Warehouse.runningMode", "")
+	a.config.shouldForceSetLowerVersion = conf.GetBool("SQLMigrator.forceSetLowerVersion", true)
+	a.config.maxOpenConnections = conf.GetInt("Warehouse.maxOpenConnections", 20)
+	a.config.configBackendURL = conf.GetString("CONFIG_BACKEND_URL", "https://api.rudderstack.com")
+	a.config.region = conf.GetString("region", "")
+
+	a.appName = misc.DefaultString("rudder-server").OnError(os.Hostname())
+
+	return a
+}
+
 var (
 	application                app.App
 	dbHandle                   *sql.DB
-	wrappedDBHandle            *sqlquerywrapper.DB
-	dbHandleTimeout            time.Duration
+	wrappedDBHandle            *sqlmw.DB
 	notifier                   pgnotifier.PGNotifier
 	tenantManager              *multitenant.Manager
 	controlPlaneClient         *controlplane.Client
 	uploadFreqInS              int64
 	lastProcessedMarkerMap     map[string]int64
-	lastProcessedMarkerExp     = expvar.NewMap("lastProcessedMarkerMap")
 	lastProcessedMarkerMapLock sync.RWMutex
 	bcManager                  *backendConfigManager
 	triggerUploadsMap          map[string]bool // `whType:sourceID:destinationID` -> boolean value representing if an upload was triggered or not
 	triggerUploadsMapLock      sync.RWMutex
 	pkgLogger                  logger.Logger
-	ShouldForceSetLowerVersion bool
 	asyncWh                    *jobs.AsyncJobWh
-)
-
-var (
-	host, user, password, dbname, sslMode, appName string
-	port                                           int
 )
 
 var defaultUploadPriority = 100
@@ -79,25 +147,7 @@ type (
 )
 
 func Init4() {
-	loadConfig()
 	pkgLogger = logger.NewLogger().Child("warehouse")
-}
-
-func loadConfig() {
-	// Port where WH is running
-	config.RegisterInt64ConfigVariable(1800, &uploadFreqInS, true, 1, "Warehouse.uploadFreqInS")
-	lastProcessedMarkerMap = map[string]int64{}
-	host = config.GetString("WAREHOUSE_JOBS_DB_HOST", "localhost")
-	user = config.GetString("WAREHOUSE_JOBS_DB_USER", "ubuntu")
-	dbname = config.GetString("WAREHOUSE_JOBS_DB_DB_NAME", "ubuntu")
-	port = config.GetInt("WAREHOUSE_JOBS_DB_PORT", 5432)
-	password = config.GetString("WAREHOUSE_JOBS_DB_PASSWORD", "ubuntu") // Reading secrets from
-	sslMode = config.GetString("WAREHOUSE_JOBS_DB_SSL_MODE", "disable")
-	triggerUploadsMap = map[string]bool{}
-	config.RegisterBoolConfigVariable(true, &ShouldForceSetLowerVersion, false, "SQLMigrator.forceSetLowerVersion")
-	config.RegisterDurationConfigVariable(5, &dbHandleTimeout, true, time.Minute, []string{"Warehouse.dbHandleTimeout", "Warehouse.dbHanndleTimeoutInMin"}...)
-
-	appName = misc.DefaultString("rudder-server").OnError(os.Hostname())
 }
 
 func getUploadFreqInS(syncFrequency string) int64 {
@@ -122,7 +172,6 @@ func setLastProcessedMarker(warehouse model.Warehouse, lastProcessedTime time.Ti
 	lastProcessedMarkerMapLock.Lock()
 	defer lastProcessedMarkerMapLock.Unlock()
 	lastProcessedMarkerMap[warehouse.Identifier] = lastProcessedTime.Unix()
-	lastProcessedMarkerExp.Set(warehouse.Identifier, lastProcessedTime)
 }
 
 func getBucketFolder(batchID, tableName string) string {
@@ -130,18 +179,16 @@ func getBucketFolder(batchID, tableName string) string {
 }
 
 // Gets the config from config backend and extracts enabled write keys
-func monitorDestRouters(ctx context.Context) error {
+func (a *App) monitorDestRouters(ctx context.Context) error {
 	dstToWhRouter := make(map[string]*router)
 
-	ch := tenantManager.WatchConfig(ctx)
-	for configData := range ch {
-		err := onConfigDataEvent(ctx, configData, dstToWhRouter)
-		if err != nil {
-			return err
+	for configData := range tenantManager.WatchConfig(ctx) {
+		if err := a.onConfigDataEvent(ctx, configData, dstToWhRouter); err != nil {
+			return fmt.Errorf("on config data event: %w", err)
 		}
 	}
 
-	g, _ := errgroup.WithContext(context.Background())
+	g, _ := errgroup.WithContext(ctx)
 	for _, router := range dstToWhRouter {
 		router := router
 		g.Go(router.Shutdown)
@@ -149,8 +196,9 @@ func monitorDestRouters(ctx context.Context) error {
 	return g.Wait()
 }
 
-func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.ConfigT, dstToWhRouter map[string]*router) error {
+func (a *App) onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.ConfigT, dstToWhRouter map[string]*router) error {
 	enabledDestinations := make(map[string]bool)
+
 	for _, wConfig := range configMap {
 		for _, source := range wConfig.Sources {
 			for _, destination := range source.Destinations {
@@ -162,26 +210,26 @@ func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.C
 
 				router, ok := dstToWhRouter[destination.DestinationDefinition.Name]
 				if ok {
-					pkgLogger.Debug("Enabling existing Destination: ", destination.DestinationDefinition.Name)
+					a.logger.Debug("Enabling existing Destination: ", destination.DestinationDefinition.Name)
 					router.Enable()
 					continue
 				}
 
-				pkgLogger.Info("Starting a new Warehouse Destination Router: ", destination.DestinationDefinition.Name)
+				a.logger.Info("Starting a new Warehouse Destination Router: ", destination.DestinationDefinition.Name)
 
 				router, err := newRouter(
 					ctx,
-					application,
+					a.app,
 					destination.DestinationDefinition.Name,
-					config.Default,
-					pkgLogger,
-					stats.Default,
-					wrappedDBHandle,
-					&notifier,
-					tenantManager,
-					controlPlaneClient,
-					bcManager,
-					encoding.NewFactory(config.Default),
+					a.conf,
+					a.logger.Child("router"),
+					a.stats,
+					a.db,
+					a.notifier,
+					a.tenantManager,
+					a.controlPlaneClient,
+					a.bcManager,
+					a.encodingFactory,
 				)
 				if err != nil {
 					return fmt.Errorf("setup warehouse %q: %w", destination.DestinationDefinition.Name, err)
@@ -191,98 +239,16 @@ func onConfigDataEvent(ctx context.Context, configMap map[string]backendconfig.C
 		}
 	}
 
-	keys := lo.Keys(dstToWhRouter)
-	for _, key := range keys {
+	for _, key := range lo.Keys(dstToWhRouter) {
 		if _, ok := enabledDestinations[key]; !ok {
 			if wh, ok := dstToWhRouter[key]; ok {
-				pkgLogger.Info("Disabling a existing warehouse destination: ", key)
+				a.logger.Info("Disabling a existing warehouse destination: ", key)
+
 				wh.Disable()
 			}
 		}
 	}
 
-	return nil
-}
-
-func setupTables(dbHandle *sql.DB) error {
-	m := &migrator.Migrator{
-		Handle:                     dbHandle,
-		MigrationsTable:            "wh_schema_migrations",
-		ShouldForceSetLowerVersion: ShouldForceSetLowerVersion,
-	}
-
-	operation := func() error {
-		return m.Migrate("warehouse")
-	}
-
-	backoffWithMaxRetry := backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 3)
-	err := backoff.RetryNotify(operation, backoffWithMaxRetry, func(err error, t time.Duration) {
-		pkgLogger.Warnf("Failed to setup WH db tables: %v, retrying after %v", err, t)
-	})
-	if err != nil {
-		return fmt.Errorf("could not run warehouse database migrations: %w", err)
-	}
-	return nil
-}
-
-func getPendingUploadCount(filters ...warehouseutils.FilterBy) (uploadCount int64, err error) {
-	pkgLogger.Debugf("Fetching pending upload count with filters: %v", filters)
-
-	query := fmt.Sprintf(`
-		SELECT
-		  COUNT(*)
-		FROM
-		  %[1]s
-		WHERE
-		  %[1]s.status NOT IN ('%[2]s', '%[3]s')
-	`,
-		warehouseutils.WarehouseUploadsTable,
-		model.ExportedData,
-		model.Aborted,
-	)
-
-	args := make([]interface{}, 0)
-	for i, filter := range filters {
-		query += fmt.Sprintf(" AND %s=$%d", filter.Key, i+1)
-		args = append(args, filter.Value)
-	}
-
-	err = wrappedDBHandle.QueryRow(query, args...).Scan(&uploadCount)
-	if err != nil && err != sql.ErrNoRows {
-		err = fmt.Errorf("query: %s failed with Error : %w", query, err)
-		return
-	}
-
-	return uploadCount, nil
-}
-
-func TriggerUploadHandler(sourceID, destID string) error {
-	// return error if source id and dest id is empty
-	if sourceID == "" && destID == "" {
-		err := fmt.Errorf("empty source and destination id")
-		pkgLogger.Errorf("[WH]: trigger upload : %v", err)
-		return err
-	}
-
-	var wh []model.Warehouse
-	if sourceID != "" && destID == "" {
-		wh = bcManager.WarehousesBySourceID(sourceID)
-	}
-	if destID != "" {
-		wh = bcManager.WarehousesByDestID(destID)
-	}
-
-	// return error if no such destinations found
-	if len(wh) == 0 {
-		err := fmt.Errorf("no warehouse destinations found for source id '%s'", sourceID)
-		pkgLogger.Errorf("[WH]: %v", err)
-		return err
-	}
-
-	// iterate over each wh destination and trigger upload
-	for _, warehouse := range wh {
-		triggerUpload(warehouse)
-	}
 	return nil
 }
 
@@ -305,83 +271,111 @@ func clearTriggeredUpload(wh model.Warehouse) {
 	delete(triggerUploadsMap, wh.Identifier)
 }
 
-func getConnectionString() string {
-	if !CheckForWarehouseEnvVars() {
-		return misc.GetConnectionString()
-	}
-	return fmt.Sprintf("host=%s port=%d user=%s "+
-		"password=%s dbname=%s sslmode=%s application_name=%s",
-		host, port, user, password, dbname, sslMode, appName)
-}
-
-// CheckForWarehouseEnvVars Checks if all the required Env Variables for Warehouse are present
-func CheckForWarehouseEnvVars() bool {
-	return config.IsSet("WAREHOUSE_JOBS_DB_HOST") &&
-		config.IsSet("WAREHOUSE_JOBS_DB_USER") &&
-		config.IsSet("WAREHOUSE_JOBS_DB_DB_NAME") &&
-		config.IsSet("WAREHOUSE_JOBS_DB_PASSWORD")
-}
-
-func setupDB(ctx context.Context, connInfo string) error {
-	var err error
-	dbHandle, err = sql.Open("postgres", connInfo)
-	if err != nil {
-		return err
-	}
-	dbHandle.SetMaxOpenConns(config.GetInt("Warehouse.maxOpenConnections", 20))
-
-	isDBCompatible, err := validators.IsPostgresCompatible(ctx, dbHandle)
-	if err != nil {
-		return err
-	}
-
-	if !isDBCompatible {
-		err := errors.New("rudder Warehouse Service needs postgres version >= 10. Exiting")
-		pkgLogger.Error(err)
-		return err
-	}
-
-	if err = dbHandle.PingContext(ctx); err != nil {
-		return fmt.Errorf("could not ping WH db: %w", err)
-	}
-
-	wrappedDBHandle = sqlquerywrapper.New(
-		dbHandle,
-		sqlquerywrapper.WithLogger(pkgLogger.Child("dbHandle")),
-		sqlquerywrapper.WithQueryTimeout(dbHandleTimeout),
-	)
-
-	return setupTables(dbHandle)
-}
-
-// Setup prepares the database connection for warehouse service, verifies database compatibility and creates the required tables
-func Setup(ctx context.Context) error {
+// Setup prepares the database connection for warehouse service.
+// Also verifies database compatibility and creates the required tables.
+func (a *App) Setup(ctx context.Context) error {
 	if !db.IsNormalMode() {
 		return nil
 	}
-	psqlInfo := getConnectionString()
-	if err := setupDB(ctx, psqlInfo); err != nil {
+	if err := a.setupDB(ctx, a.connectionString()); err != nil {
 		return fmt.Errorf("cannot setup warehouse db: %w", err)
 	}
 	return nil
 }
 
+func (a *App) connectionString() string {
+	if !a.checkForWarehouseEnvVars() {
+		return misc.GetConnectionString()
+	}
+
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s application_name=%s",
+		a.config.host,
+		a.config.port,
+		a.config.user,
+		a.config.password,
+		a.config.database,
+		a.config.sslMode,
+		a.appName,
+	)
+}
+
+// checkForWarehouseEnvVars checks if the required database environment variables are set
+func (a *App) checkForWarehouseEnvVars() bool {
+	return a.conf.IsSet("WAREHOUSE_JOBS_DB_HOST") &&
+		a.conf.IsSet("WAREHOUSE_JOBS_DB_USER") &&
+		a.conf.IsSet("WAREHOUSE_JOBS_DB_DB_NAME") &&
+		a.conf.IsSet("WAREHOUSE_JOBS_DB_PASSWORD")
+}
+
+func (a *App) setupDB(ctx context.Context, dsn string) error {
+	database, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("could not open: %w", err)
+	}
+	database.SetMaxOpenConns(a.config.maxOpenConnections)
+
+	isCompatible, err := validators.IsPostgresCompatible(ctx, database)
+	if err != nil {
+		return fmt.Errorf("could not check compatibility: %w", err)
+	} else if !isCompatible {
+		return errors.New("warehouse Service needs postgres version >= 10. Exiting")
+	}
+
+	if err := database.PingContext(ctx); err != nil {
+		return fmt.Errorf("could not ping: %w", err)
+	}
+
+	a.db = sqlmw.New(
+		database,
+		sqlmw.WithLogger(a.logger.Child("db")),
+		sqlmw.WithQueryTimeout(a.config.dbQueryTimeout),
+		sqlmw.WithStats(a.stats),
+	)
+
+	err = a.setupTables()
+	if err != nil {
+		return fmt.Errorf("could not setup tables: %w", err)
+	}
+
+	return nil
+}
+
+func (a *App) setupTables() error {
+	m := &migrator.Migrator{
+		Handle:                     a.db.DB,
+		MigrationsTable:            "wh_schema_migrations",
+		ShouldForceSetLowerVersion: a.config.shouldForceSetLowerVersion,
+	}
+
+	operation := func() error {
+		return m.Migrate("warehouse")
+	}
+
+	backoffWithMaxRetry := backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 3)
+
+	err := backoff.RetryNotify(operation, backoffWithMaxRetry, func(err error, t time.Duration) {
+		a.logger.Warnf("retrying warehouse database migration in %s: %v", t, err)
+	})
+	if err != nil {
+		return fmt.Errorf("could not migrate: %w", err)
+	}
+
+	return nil
+}
+
 // Start starts the warehouse service
-func Start(ctx context.Context, app app.App) error {
-	application = app
-
-	mode := config.GetString("Warehouse.mode", config.EmbeddedMode)
-
-	if dbHandle == nil && !isStandAloneSlave(mode) {
+func (a *App) Start(ctx context.Context, app app.App) error {
+	if a.db == nil && !isStandAloneSlave(a.config.warehouseMode) {
 		return errors.New("warehouse service cannot start, database connection is not setup")
 	}
+
 	// do not start warehouse service if rudder core is not in normal mode and warehouse is running in same process as rudder core
-	if !isStandAlone(mode) && !db.IsNormalMode() {
-		pkgLogger.Infof("Skipping start of warehouse service...")
+	if !isStandAlone(a.config.warehouseMode) && !db.IsNormalMode() {
+		a.logger.Infof("Skipping start of warehouse service...")
 		return nil
 	}
 
-	pkgLogger.Infof("WH: Starting Warehouse service...")
+	a.logger.Infof("WH: Starting Warehouse service...")
 	psqlInfo := getConnectionString()
 
 	defer func() {

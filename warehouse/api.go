@@ -272,6 +272,67 @@ func (uploadsReq *UploadsReq) TriggerWhUploads(ctx context.Context) (response *p
 	return
 }
 
+func TriggerUploadHandler(sourceID, destID string) error {
+	// return error if source id and dest id is empty
+	if sourceID == "" && destID == "" {
+		err := fmt.Errorf("empty source and destination id")
+		pkgLogger.Errorf("[WH]: trigger upload : %v", err)
+		return err
+	}
+
+	var wh []model.Warehouse
+	if sourceID != "" && destID == "" {
+		wh = bcManager.WarehousesBySourceID(sourceID)
+	}
+	if destID != "" {
+		wh = bcManager.WarehousesByDestID(destID)
+	}
+
+	// return error if no such destinations found
+	if len(wh) == 0 {
+		err := fmt.Errorf("no warehouse destinations found for source id '%s'", sourceID)
+		pkgLogger.Errorf("[WH]: %v", err)
+		return err
+	}
+
+	// iterate over each wh destination and trigger upload
+	for _, warehouse := range wh {
+		triggerUpload(warehouse)
+	}
+	return nil
+}
+
+func getPendingUploadCount(filters ...warehouseutils.FilterBy) (uploadCount int64, err error) {
+	pkgLogger.Debugf("Fetching pending upload count with filters: %v", filters)
+
+	query := fmt.Sprintf(`
+		SELECT
+		  COUNT(*)
+		FROM
+		  %[1]s
+		WHERE
+		  %[1]s.status NOT IN ('%[2]s', '%[3]s')
+	`,
+		warehouseutils.WarehouseUploadsTable,
+		model.ExportedData,
+		model.Aborted,
+	)
+
+	args := make([]interface{}, 0)
+	for i, filter := range filters {
+		query += fmt.Sprintf(" AND %s=$%d", filter.Key, i+1)
+		args = append(args, filter.Value)
+	}
+
+	err = wrappedDBHandle.QueryRow(query, args...).Scan(&uploadCount)
+	if err != nil && err != sql.ErrNoRows {
+		err = fmt.Errorf("query: %s failed with Error : %w", query, err)
+		return
+	}
+
+	return uploadCount, nil
+}
+
 func (uploadReq *UploadReq) GetWHUpload(ctx context.Context) (*proto.WHUploadResponse, error) {
 	err := uploadReq.validateReq()
 	if err != nil {
