@@ -71,7 +71,7 @@ type Archiver struct {
 }
 
 func (a *Archiver) backupRecords(ctx context.Context, args backupRecordsArgs) (backupLocation string, err error) {
-	logFields := []lf.KeyValue{
+	logFields := []lf.KVInterface{
 		lf.UploadID(args.uploadID),
 		lf.SourceID(args.sourceID),
 		lf.DestinationID(args.destID),
@@ -350,7 +350,7 @@ func (a *Archiver) Do(ctx context.Context) error {
 		}).Increment()
 	}
 
-	a.Logger.Infow("Successfully archived uploads", lf.Generic("numArchivedUploads")(archivedUploads))
+	a.Logger.Infow("Successfully archived uploads", lf.Generic[int]("numArchivedUploads")(archivedUploads))
 
 	return nil
 }
